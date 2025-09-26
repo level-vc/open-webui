@@ -22,7 +22,6 @@
 	import Beaker from '$lib/components/icons/Beaker.svelte';
 	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
 	import ChevronLeft from '$lib/components/icons/ChevronLeft.svelte';
-	import ValvesModal from '$lib/components/workspace/common/ValvesModal.svelte';
 
 	const i18n = getContext('i18n');
 
@@ -44,15 +43,11 @@
 	export let showExperimentalModeButton = false;
 	export let experimentalModeEnabled = false;
 
+	export let onShowValves: Function;
 	export let onClose: Function;
 
 	let show = false;
 	let tab = '';
-
-	let showValvesModal = false;
-
-	let selectedValvesType = 'tool';
-	let selectedValvesItemId = null;
 
 	let tools = null;
 
@@ -98,16 +93,6 @@
 		selectedToolIds = selectedToolIds.filter((id) => Object.keys(tools).includes(id));
 	};
 </script>
-
-<ValvesModal
-	bind:show={showValvesModal}
-	userValves={true}
-	type={selectedValvesType}
-	id={selectedValvesItemId ?? null}
-	on:save={async () => {
-		await tick();
-	}}
-/>
 
 <Dropdown
 	bind:show
@@ -194,6 +179,27 @@
 											<div class=" truncate">{filter?.name}</div>
 										</div>
 									</div>
+
+									{#if filter?.has_user_valves}
+										<div class=" shrink-0">
+											<Tooltip content={$i18n.t('Valves')}>
+												<button
+													class="self-center w-fit text-sm text-gray-600 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 transition rounded-full"
+													type="button"
+													on:click={(e) => {
+														e.stopPropagation();
+														e.preventDefault();
+														onShowValves({
+															type: 'function',
+															id: filter.id
+														});
+													}}
+												>
+													<Knobs />
+												</button>
+											</Tooltip>
+										</div>
+									{/if}
 
 									<div class=" shrink-0">
 										<Switch
@@ -402,9 +408,10 @@
 											on:click={(e) => {
 												e.stopPropagation();
 												e.preventDefault();
-												selectedValvesType = 'tool';
-												selectedValvesItemId = toolId;
-												showValvesModal = true;
+												onShowValves({
+													type: 'tool',
+													id: toolId
+												});
 											}}
 										>
 											<Knobs />
