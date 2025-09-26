@@ -2,6 +2,9 @@ name: '[PRD] Build and deploy Open WebUI'
 
 on:
     workflow_dispatch:
+    push:
+        branches:
+            - lvc
     pull_request:
         types:
             - closed
