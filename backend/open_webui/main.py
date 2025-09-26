@@ -504,6 +504,13 @@ logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
+import sentry_sdk
+
+sentry_sdk.init(
+    dsn="https://5960f10a9a5ab30f6e855162e5b2e8b9@o4509033024847872.ingest.us.sentry.io/4510081988820992",
+    send_default_pii=True,
+    traces_sample_rate=1.0,
+)
 
 class SPAStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):

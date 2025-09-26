@@ -232,20 +232,11 @@
 
 	const onSelectedModelIdsChange = () => {
 		if (oldSelectedModelIds.filter((id) => id).length > 0) {
-			resetInput();
+			setDefaults();
 		}
 		oldSelectedModelIds = selectedModelIds;
 	};
 
-	const resetInput = () => {
-		selectedToolIds = [];
-		selectedFilterIds = [];
-		webSearchEnabled = false;
-		imageGenerationEnabled = false;
-		codeInterpreterEnabled = false;
-
-		setDefaults();
-	};
 
 	const setDefaults = async () => {
 		if (!$tools) {
@@ -859,7 +850,7 @@
 
 		autoScroll = true;
 
-		resetInput();
+		setDefaults();
 		await chatId.set('');
 		await chatTitle.set('');
 

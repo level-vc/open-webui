@@ -1299,16 +1299,6 @@
 																}
 															}
 
-															if (e.key === 'Escape') {
-																console.log('Escape');
-																atSelectedModel = undefined;
-																selectedToolIds = [];
-																selectedFilterIds = [];
-
-																webSearchEnabled = false;
-																imageGenerationEnabled = false;
-																codeInterpreterEnabled = false;
-															}
 														}}
 														on:paste={async (e) => {
 															e = e.detail.event;

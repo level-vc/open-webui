@@ -1,0 +1,77 @@
+name: '[PRD] Build and deploy Open WebUI'
+
+on:
+    workflow_dispatch:
+    pull_request:
+        types:
+            - closed
+        branches:
+            - lvc
+
+jobs:
+    build-and-push:
+        runs-on: ubuntu-latest
+        environment: Main
+        steps:
+            - uses: actions/checkout@v3
+              with:
+                  ref: 'lvc'
+
+            - name: Configure AWS Credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ vars.AWS_REGION }}
+
+            - name: Login to Amazon ECR
+              id: login_ecr
+              uses: aws-actions/amazon-ecr-login@v1
+
+            - name: Build, tag, and push image to Amazon ECR
+              id: build_image
+              uses: docker/build-push-action@v5
+              with:
+                  file: Dockerfile
+                  push: true
+                  tags: |
+                      ${{ vars.ECR_REPOSITORY }}/lvc-open-webui:latest
+
+    update-ecs-service:
+        runs-on: ubuntu-latest
+        environment: Main
+        needs: build-and-push
+        steps:
+            - name: Configure AWS Credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ vars.AWS_REGION }}
+
+            - name: Update ECS Service with Blue-Green Deployment
+              run: |
+                  # Get current task definition
+                  CURRENT_TASK_DEF=$(aws ecs describe-services --cluster open-webui-cluster --services open-webui-service --query 'services[0].taskDefinition' --output text)
+
+                  # Update service with new task definition and enable blue-green deployment
+                  aws ecs update-service \
+                    --cluster open-webui-cluster \
+                    --service open-webui-service \
+                    --task-definition $CURRENT_TASK_DEF \
+                    --deployment-configuration "{
+                      \"deploymentCircuitBreaker\": {
+                        \"enable\": true,
+                        \"rollback\": true
+                      },
+                      \"maximumPercent\": 200,
+                      \"minimumHealthyPercent\": 100
+                    }" \
+                    --force-new-deployment
+
+            - name: Wait for Deployment to Complete
+              run: |
+                  # Wait for the deployment to complete
+                  aws ecs wait services-stable \
+                    --cluster open-webui-cluster \
+                    --services open-webui-service
