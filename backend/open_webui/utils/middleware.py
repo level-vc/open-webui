@@ -2644,23 +2644,19 @@ async def process_chat_response(
 
                         tool_result_files = []
                         if isinstance(tool_result, list):
-                            for item in tool_result:
-                                # check if string
-                                if isinstance(item, str) and item.startswith("data:"):
-                                    tool_result_files.append(
-                                        {
-                                            "type": "data",
-                                            "content": item,
-                                        }
-                                    )
-                                    tool_result.remove(item)
-
-                                if tool.get("type") == "mcp":
+                            if tool.get("type") == "mcp":  # MCP
+                                response = []
+                                for item in tool_result:
                                     if isinstance(item, dict):
-                                        if (
-                                            item.get("type") == "image"
-                                            or item.get("type") == "audio"
-                                        ):
+                                        if item.get("type") == "text":
+                                            text = item.get("text", "")
+                                            if isinstance(text, str):
+                                                try:
+                                                    text = json.loads(text)
+                                                except json.JSONDecodeError:
+                                                    pass
+                                            response.append(text)
+                                        elif item.get("type") in ["image", "audio"]:
                                             file_url = get_file_url_from_base64(
                                                 request,
                                                 f"data:{item.get('mimeType')};base64,{item.get('data', item.get('blob', ''))}",
@@ -2685,7 +2681,22 @@ async def process_chat_response(
                                                     "url": file_url,
                                                 }
                                             )
-                                            tool_result.remove(item)
+                                tool_result = (
+                                    response[0] if len(response) == 1 else response
+                                )
+                            else:  # OpenAPI
+                                for item in tool_result:
+                                    # check if string
+                                    if isinstance(item, str) and item.startswith(
+                                        "data:"
+                                    ):
+                                        tool_result_files.append(
+                                            {
+                                                "type": "data",
+                                                "content": item,
+                                            }
+                                        )
+                                        tool_result.remove(item)
 
                         if tool_result_files:
                             if not isinstance(tool_result, list):
