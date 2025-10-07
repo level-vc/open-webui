@@ -61,6 +61,7 @@
 		files?: { type: string; url: string }[];
 		timestamp: number;
 		role: string;
+		trace_url?: string;
 		statusHistory?: {
 			done: boolean;
 			action: string;
@@ -643,6 +644,7 @@
 						</Tooltip>
 					</div>
 				{/if}
+
 			</Name>
 
 			<div>
@@ -1161,6 +1163,26 @@
 												/>
 											</svg>
 										</button>
+									</Tooltip>
+								{/if}
+
+								{#if message.trace_url}
+									<Tooltip content="View Langfuse trace" placement="bottom">
+										<a
+											href={message.trace_url}
+											target="_blank"
+											rel="noopener noreferrer"
+											aria-label="View Langfuse trace"
+											class="{isLastMessage || ($settings?.highContrastMode ?? false)
+												? 'visible'
+												: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition inline-flex items-center justify-center"
+										>
+											<img
+												src="/assets/images/langfuse.png"
+												alt="Langfuse"
+												class="w-4 h-4"
+											/>
+										</a>
 									</Tooltip>
 								{/if}
 

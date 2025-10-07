@@ -51,6 +51,7 @@
 	export let imageGenerationEnabled = false;
 	export let codeInterpreterEnabled = false;
 	export let webSearchEnabled = false;
+	export let experimentalModeEnabled = false;
 
 	export let onSelect = (e) => {};
 	export let onChange = (e) => {};
@@ -215,6 +216,7 @@
 					bind:selectedFilterIds
 					bind:imageGenerationEnabled
 					bind:codeInterpreterEnabled
+					bind:experimentalModeEnabled
 					bind:webSearchEnabled
 					bind:atSelectedModel
 					bind:showCommands

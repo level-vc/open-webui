@@ -187,6 +187,7 @@ type Settings = {
 	splitLargeDeltas?: boolean;
 	chatDirection?: 'LTR' | 'RTL' | 'auto';
 	ctrlEnterToSend?: boolean;
+	experimentalModeEnabled?: boolean;
 
 	system?: string;
 	seed?: number;

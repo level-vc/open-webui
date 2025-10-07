@@ -112,6 +112,7 @@ from open_webui.env import (
     ENABLE_QUERIES_CACHE,
 )
 from open_webui.constants import TASKS
+from open_webui.utils.langfuse_utils import get_langfuse_client
 
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
@@ -136,427 +137,280 @@ DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
 async def chat_completion_tools_handler(
     request: Request, body: dict, extra_params: dict, user: UserModel, models, tools
 ) -> tuple[dict, dict]:
-    async def get_content_from_response(response) -> Optional[str]:
-        content = None
-        if hasattr(response, "body_iterator"):
-            async for chunk in response.body_iterator:
-                data = json.loads(chunk.decode("utf-8"))
-                content = data["choices"][0]["message"]["content"]
+    langfuse_client = get_langfuse_client()
+    with langfuse_client.start_as_current_span(name="chat-completion-tools-handler") as span:
+        span.update(input={"model": body.get("model"), "tools_count": len(tools), "user_id": user.id})
+        
+        async def get_content_from_response(response) -> Optional[str]:
+            content = None
+            if hasattr(response, "body_iterator"):
+                async for chunk in response.body_iterator:
+                    data = json.loads(chunk.decode("utf-8"))
+                    content = data["choices"][0]["message"]["content"]
 
-            # Cleanup any remaining background tasks if necessary
-            if response.background is not None:
-                await response.background()
-        else:
-            content = response["choices"][0]["message"]["content"]
-        return content
+                # Cleanup any remaining background tasks if necessary
+                if response.background is not None:
+                    await response.background()
+            else:
+                content = response["choices"][0]["message"]["content"]
+            return content
 
-    def get_tools_function_calling_payload(messages, task_model_id, content):
-        user_message = get_last_user_message(messages)
+        def get_tools_function_calling_payload(messages, task_model_id, content):
+            user_message = get_last_user_message(messages)
 
-        recent_messages = messages[-4:] if len(messages) > 4 else messages
-        chat_history = "\n".join(
-            f"{message['role'].upper()}: \"\"\"{message['content']}\"\"\""
-            for message in recent_messages
+            recent_messages = messages[-4:] if len(messages) > 4 else messages
+            chat_history = "\n".join(
+                f"{message['role'].upper()}: \"\"\"{message['content']}\"\"\""
+                for message in recent_messages
+            )
+
+            prompt = f"History:\n{chat_history}\nQuery: {user_message}"
+
+            return {
+                "model": task_model_id,
+                "messages": [
+                    {"role": "system", "content": content},
+                    {"role": "user", "content": f"Query: {prompt}"},
+                ],
+                "stream": False,
+                "metadata": {"task": str(TASKS.FUNCTION_CALLING)},
+            }
+
+        event_caller = extra_params["__event_call__"]
+        metadata = extra_params["__metadata__"]
+
+        task_model_id = get_task_model_id(
+            body["model"],
+            request.app.state.config.TASK_MODEL,
+            request.app.state.config.TASK_MODEL_EXTERNAL,
+            models,
         )
 
-        prompt = f"History:\n{chat_history}\nQuery: {user_message}"
+        skip_files = False
+        sources = []
 
-        return {
-            "model": task_model_id,
-            "messages": [
-                {"role": "system", "content": content},
-                {"role": "user", "content": f"Query: {prompt}"},
-            ],
-            "stream": False,
-            "metadata": {"task": str(TASKS.FUNCTION_CALLING)},
-        }
+        specs = [tool["spec"] for tool in tools.values()]
+        tools_specs = json.dumps(specs)
 
-    event_caller = extra_params["__event_call__"]
-    metadata = extra_params["__metadata__"]
+        if request.app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE != "":
+            template = request.app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
+        else:
+            template = DEFAULT_TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
 
-    task_model_id = get_task_model_id(
-        body["model"],
-        request.app.state.config.TASK_MODEL,
-        request.app.state.config.TASK_MODEL_EXTERNAL,
-        models,
-    )
-
-    skip_files = False
-    sources = []
-
-    specs = [tool["spec"] for tool in tools.values()]
-    tools_specs = json.dumps(specs)
-
-    if request.app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE != "":
-        template = request.app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-    else:
-        template = DEFAULT_TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-
-    tools_function_calling_prompt = tools_function_calling_generation_template(
-        template, tools_specs
-    )
-    payload = get_tools_function_calling_payload(
-        body["messages"], task_model_id, tools_function_calling_prompt
-    )
-
-    try:
-        response = await generate_chat_completion(request, form_data=payload, user=user)
-        log.debug(f"{response=}")
-        content = await get_content_from_response(response)
-        log.debug(f"{content=}")
-
-        if not content:
-            return body, {}
+        tools_function_calling_prompt = tools_function_calling_generation_template(
+            template, tools_specs
+        )
+        payload = get_tools_function_calling_payload(
+            body["messages"], task_model_id, tools_function_calling_prompt
+        )
 
         try:
-            content = content[content.find("{") : content.rfind("}") + 1]
+            response = await generate_chat_completion(request, form_data=payload, user=user)
+            log.debug(f"{response=}")
+            content = await get_content_from_response(response)
+            log.debug(f"{content=}")
+
             if not content:
-                raise Exception("No JSON object found in the response")
+                span.update(output={"success": False, "reason": "no_content"})
+                return body, {}
 
-            result = json.loads(content)
+            try:
+                content = content[content.find("{") : content.rfind("}") + 1]
+                if not content:
+                    raise Exception("No JSON object found in the response")
 
-            async def tool_call_handler(tool_call):
-                nonlocal skip_files
+                result = json.loads(content)
 
-                log.debug(f"{tool_call=}")
+                async def tool_call_handler(tool_call):
+                    nonlocal skip_files
 
-                tool_function_name = tool_call.get("name", None)
-                if tool_function_name not in tools:
-                    return body, {}
+                    log.debug(f"{tool_call=}")
 
-                tool_function_params = tool_call.get("parameters", {})
+                    tool_function_name = tool_call.get("name", None)
+                    if tool_function_name not in tools:
+                        return body, {}
 
-                try:
-                    tool = tools[tool_function_name]
+                    tool_function_params = tool_call.get("parameters", {})
 
-                    spec = tool.get("spec", {})
-                    allowed_params = (
-                        spec.get("parameters", {}).get("properties", {}).keys()
-                    )
-                    tool_function_params = {
-                        k: v
-                        for k, v in tool_function_params.items()
-                        if k in allowed_params
-                    }
+                    try:
+                        tool = tools[tool_function_name]
 
-                    if tool.get("direct", False):
-                        tool_result = await event_caller(
+                        spec = tool.get("spec", {})
+                        allowed_params = (
+                            spec.get("parameters", {}).get("properties", {}).keys()
+                        )
+                        tool_function_params = {
+                            k: v
+                            for k, v in tool_function_params.items()
+                            if k in allowed_params
+                        }
+
+                        if tool.get("direct", False):
+                            tool_result = await event_caller(
+                                {
+                                    "type": "execute:tool",
+                                    "data": {
+                                        "id": str(uuid4()),
+                                        "name": tool_function_name,
+                                        "params": tool_function_params,
+                                        "server": tool.get("server", {}),
+                                        "session_id": metadata.get("session_id", None),
+                                    },
+                                }
+                            )
+                        else:
+                            tool_function = tool["callable"]
+                            tool_result = await tool_function(**tool_function_params)
+
+                    except Exception as e:
+                        tool_result = str(e)
+
+                    tool_result_files = []
+                    if isinstance(tool_result, list):
+                        for item in tool_result:
+                            # check if string
+                            if isinstance(item, str) and item.startswith("data:"):
+                                tool_result_files.append(item)
+                                tool_result.remove(item)
+
+                    if isinstance(tool_result, dict) or isinstance(tool_result, list):
+                        tool_result = json.dumps(tool_result, indent=2)
+
+                    if isinstance(tool_result, str):
+                        tool = tools[tool_function_name]
+                        tool_id = tool.get("tool_id", "")
+
+                        tool_name = (
+                            f"{tool_id}/{tool_function_name}"
+                            if tool_id
+                            else f"{tool_function_name}"
+                        )
+
+                        # Citation is enabled for this tool
+                        sources.append(
                             {
-                                "type": "execute:tool",
-                                "data": {
-                                    "id": str(uuid4()),
-                                    "name": tool_function_name,
-                                    "params": tool_function_params,
-                                    "server": tool.get("server", {}),
-                                    "session_id": metadata.get("session_id", None),
+                                "source": {
+                                    "name": (f"TOOL:{tool_name}"),
                                 },
+                                "document": [tool_result],
+                                "metadata": [
+                                    {
+                                        "source": (f"TOOL:{tool_name}"),
+                                        "parameters": tool_function_params,
+                                    }
+                                ],
+                                "tool_result": True,
                             }
                         )
-                    else:
-                        tool_function = tool["callable"]
-                        tool_result = await tool_function(**tool_function_params)
+                        # Citation is not enabled for this tool
+                        body["messages"] = add_or_update_user_message(
+                            f"\nTool `{tool_name}` Output: {tool_result}",
+                            body["messages"],
+                        )
 
-                except Exception as e:
-                    tool_result = str(e)
+                        if (
+                            tools[tool_function_name]
+                            .get("metadata", {})
+                            .get("file_handler", False)
+                        ):
+                            skip_files = True
 
-                tool_result_files = []
-                if isinstance(tool_result, list):
-                    for item in tool_result:
-                        # check if string
-                        if isinstance(item, str) and item.startswith("data:"):
-                            tool_result_files.append(item)
-                            tool_result.remove(item)
+                # check if "tool_calls" in result
+                if result.get("tool_calls"):
+                    for tool_call in result.get("tool_calls"):
+                        await tool_call_handler(tool_call)
+                else:
+                    await tool_call_handler(result)
 
-                if isinstance(tool_result, dict) or isinstance(tool_result, list):
-                    tool_result = json.dumps(tool_result, indent=2)
-
-                if isinstance(tool_result, str):
-                    tool = tools[tool_function_name]
-                    tool_id = tool.get("tool_id", "")
-
-                    tool_name = (
-                        f"{tool_id}/{tool_function_name}"
-                        if tool_id
-                        else f"{tool_function_name}"
-                    )
-
-                    # Citation is enabled for this tool
-                    sources.append(
-                        {
-                            "source": {
-                                "name": (f"TOOL:{tool_name}"),
-                            },
-                            "document": [tool_result],
-                            "metadata": [
-                                {
-                                    "source": (f"TOOL:{tool_name}"),
-                                    "parameters": tool_function_params,
-                                }
-                            ],
-                            "tool_result": True,
-                        }
-                    )
-                    # Citation is not enabled for this tool
-                    body["messages"] = add_or_update_user_message(
-                        f"\nTool `{tool_name}` Output: {tool_result}",
-                        body["messages"],
-                    )
-
-                    if (
-                        tools[tool_function_name]
-                        .get("metadata", {})
-                        .get("file_handler", False)
-                    ):
-                        skip_files = True
-
-            # check if "tool_calls" in result
-            if result.get("tool_calls"):
-                for tool_call in result.get("tool_calls"):
-                    await tool_call_handler(tool_call)
-            else:
-                await tool_call_handler(result)
-
+            except Exception as e:
+                log.debug(f"Error: {e}")
+                content = None
         except Exception as e:
             log.debug(f"Error: {e}")
             content = None
-    except Exception as e:
-        log.debug(f"Error: {e}")
-        content = None
 
-    log.debug(f"tool_contexts: {sources}")
+        log.debug(f"tool_contexts: {sources}")
 
-    if skip_files and "files" in body.get("metadata", {}):
-        del body["metadata"]["files"]
+        if skip_files and "files" in body.get("metadata", {}):
+            del body["metadata"]["files"]
 
-    return body, {"sources": sources}
+        span.update(output={"success": True, "sources_count": len(sources), "skip_files": skip_files})
+        return body, {"sources": sources}
 
 
 async def chat_memory_handler(
     request: Request, form_data: dict, extra_params: dict, user
 ):
-    try:
-        results = await query_memory(
-            request,
-            QueryMemoryForm(
-                **{
-                    "content": get_last_user_message(form_data["messages"]) or "",
-                    "k": 3,
-                }
-            ),
-            user,
+    langfuse_client = get_langfuse_client()
+    with langfuse_client.start_as_current_span(name="chat-memory-handler") as span:
+        span.update(input={"user_id": user.id, "messages_count": len(form_data.get("messages", []))})
+        
+        try:
+            results = await query_memory(
+                request,
+                QueryMemoryForm(
+                    **{
+                        "content": get_last_user_message(form_data["messages"]) or "",
+                        "k": 3,
+                    }
+                ),
+                user,
+            )
+        except Exception as e:
+            log.debug(e)
+            results = None
+
+        user_context = ""
+        if results and hasattr(results, "documents"):
+            if results.documents and len(results.documents) > 0:
+                for doc_idx, doc in enumerate(results.documents[0]):
+                    created_at_date = "Unknown Date"
+
+                    if results.metadatas[0][doc_idx].get("created_at"):
+                        created_at_timestamp = results.metadatas[0][doc_idx]["created_at"]
+                        created_at_date = time.strftime(
+                            "%Y-%m-%d", time.localtime(created_at_timestamp)
+                        )
+
+                    user_context += f"{doc_idx + 1}. [{created_at_date}] {doc}\n"
+
+        form_data["messages"] = add_or_update_system_message(
+            f"User Context:\n{user_context}\n", form_data["messages"], append=True
         )
-    except Exception as e:
-        log.debug(e)
-        results = None
 
-    user_context = ""
-    if results and hasattr(results, "documents"):
-        if results.documents and len(results.documents) > 0:
-            for doc_idx, doc in enumerate(results.documents[0]):
-                created_at_date = "Unknown Date"
-
-                if results.metadatas[0][doc_idx].get("created_at"):
-                    created_at_timestamp = results.metadatas[0][doc_idx]["created_at"]
-                    created_at_date = time.strftime(
-                        "%Y-%m-%d", time.localtime(created_at_timestamp)
-                    )
-
-                user_context += f"{doc_idx + 1}. [{created_at_date}] {doc}\n"
-
-    form_data["messages"] = add_or_update_system_message(
-        f"User Context:\n{user_context}\n", form_data["messages"], append=True
-    )
-
-    return form_data
+        span.update(output={"success": True, "context_length": len(user_context), "documents_found": len(results.documents[0]) if results and hasattr(results, "documents") and results.documents else 0})
+        return form_data
 
 
 async def chat_web_search_handler(
     request: Request, form_data: dict, extra_params: dict, user
 ):
-    event_emitter = extra_params["__event_emitter__"]
-    await event_emitter(
-        {
-            "type": "status",
-            "data": {
-                "action": "web_search",
-                "description": "Searching the web",
-                "done": False,
-            },
-        }
-    )
-
-    messages = form_data["messages"]
-    user_message = get_last_user_message(messages)
-
-    queries = []
-    try:
-        res = await generate_queries(
-            request,
-            {
-                "model": form_data["model"],
-                "messages": messages,
-                "prompt": user_message,
-                "type": "web_search",
-            },
-            user,
-        )
-
-        response = res["choices"][0]["message"]["content"]
-
-        try:
-            bracket_start = response.find("{")
-            bracket_end = response.rfind("}") + 1
-
-            if bracket_start == -1 or bracket_end == -1:
-                raise Exception("No JSON object found in the response")
-
-            response = response[bracket_start:bracket_end]
-            queries = json.loads(response)
-            queries = queries.get("queries", [])
-        except Exception as e:
-            queries = [response]
-
-        if ENABLE_QUERIES_CACHE:
-            request.state.cached_queries = queries
-
-    except Exception as e:
-        log.exception(e)
-        queries = [user_message]
-
-    # Check if generated queries are empty
-    if len(queries) == 1 and queries[0].strip() == "":
-        queries = [user_message]
-
-    # Check if queries are not found
-    if len(queries) == 0:
+    langfuse_client = get_langfuse_client()
+    with langfuse_client.start_as_current_span(name="chat-web-search-handler") as span:
+        event_emitter = extra_params["__event_emitter__"]
         await event_emitter(
             {
                 "type": "status",
                 "data": {
                     "action": "web_search",
-                    "description": "No search query generated",
-                    "done": True,
-                },
-            }
-        )
-        return form_data
-
-    await event_emitter(
-        {
-            "type": "status",
-            "data": {
-                "action": "web_search_queries_generated",
-                "queries": queries,
-                "done": False,
-            },
-        }
-    )
-
-    try:
-        results = await process_web_search(
-            request,
-            SearchForm(queries=queries),
-            user=user,
-        )
-
-        if results:
-            files = form_data.get("files", [])
-
-            if results.get("collection_names"):
-                for col_idx, collection_name in enumerate(
-                    results.get("collection_names")
-                ):
-                    files.append(
-                        {
-                            "collection_name": collection_name,
-                            "name": ", ".join(queries),
-                            "type": "web_search",
-                            "urls": results["filenames"],
-                            "queries": queries,
-                        }
-                    )
-            elif results.get("docs"):
-                # Invoked when bypass embedding and retrieval is set to True
-                docs = results["docs"]
-                files.append(
-                    {
-                        "docs": docs,
-                        "name": ", ".join(queries),
-                        "type": "web_search",
-                        "urls": results["filenames"],
-                        "queries": queries,
-                    }
-                )
-
-            form_data["files"] = files
-
-            await event_emitter(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "web_search",
-                        "description": "Searched {{count}} sites",
-                        "urls": results["filenames"],
-                        "items": results.get("items", []),
-                        "done": True,
-                    },
-                }
-            )
-        else:
-            await event_emitter(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "web_search",
-                        "description": "No search results found",
-                        "done": True,
-                        "error": True,
-                    },
-                }
-            )
-
-    except Exception as e:
-        log.exception(e)
-        await event_emitter(
-            {
-                "type": "status",
-                "data": {
-                    "action": "web_search",
-                    "description": "An error occurred while searching the web",
-                    "queries": queries,
-                    "done": True,
-                    "error": True,
+                    "description": "Searching the web",
+                    "done": False,
                 },
             }
         )
 
-    return form_data
+        messages = form_data["messages"]
+        user_message = get_last_user_message(messages)
 
-
-async def chat_image_generation_handler(
-    request: Request, form_data: dict, extra_params: dict, user
-):
-    __event_emitter__ = extra_params["__event_emitter__"]
-    await __event_emitter__(
-        {
-            "type": "status",
-            "data": {"description": "Creating image", "done": False},
-        }
-    )
-
-    messages = form_data["messages"]
-    user_message = get_last_user_message(messages)
-
-    prompt = user_message
-    negative_prompt = ""
-
-    if request.app.state.config.ENABLE_IMAGE_PROMPT_GENERATION:
+        queries = []
         try:
-            res = await generate_image_prompt(
+            res = await generate_queries(
                 request,
                 {
                     "model": form_data["model"],
                     "messages": messages,
+                    "prompt": user_message,
+                    "type": "web_search",
                 },
                 user,
             )
@@ -571,194 +425,372 @@ async def chat_image_generation_handler(
                     raise Exception("No JSON object found in the response")
 
                 response = response[bracket_start:bracket_end]
-                response = json.loads(response)
-                prompt = response.get("prompt", [])
+                queries = json.loads(response)
+                queries = queries.get("queries", [])
             except Exception as e:
-                prompt = user_message
+                queries = [response]
+
+            if ENABLE_QUERIES_CACHE:
+                request.state.cached_queries = queries
 
         except Exception as e:
             log.exception(e)
-            prompt = user_message
+            queries = [user_message]
 
-    system_message_content = ""
+        # Check if generated queries are empty
+        if len(queries) == 1 and queries[0].strip() == "":
+            queries = [user_message]
 
-    try:
-        images = await image_generations(
-            request=request,
-            form_data=GenerateImageForm(**{"prompt": prompt}),
-            user=user,
-        )
+        # Check if queries are not found
+        if len(queries) == 0:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "web_search",
+                        "description": "No search query generated",
+                        "done": True,
+                    },
+                }
+            )
+            span.update(output={"success": False, "reason": "no_queries_generated"})
+            return form_data
 
-        await __event_emitter__(
+        await event_emitter(
             {
                 "type": "status",
-                "data": {"description": "Image created", "done": True},
+                "data": {
+                    "action": "web_search_queries_generated",
+                    "queries": queries,
+                    "done": False,
+                },
             }
         )
 
-        await __event_emitter__(
-            {
-                "type": "files",
-                "data": {
-                    "files": [
+        try:
+            results = await process_web_search(
+                request,
+                SearchForm(queries=queries),
+                user=user,
+            )
+
+            if results:
+                files = form_data.get("files", [])
+
+                if results.get("collection_names"):
+                    for col_idx, collection_name in enumerate(
+                        results.get("collection_names")
+                    ):
+                        files.append(
+                            {
+                                "collection_name": collection_name,
+                                "name": ", ".join(queries),
+                                "type": "web_search",
+                                "urls": results["filenames"],
+                                "queries": queries,
+                            }
+                        )
+                elif results.get("docs"):
+                    # Invoked when bypass embedding and retrieval is set to True
+                    docs = results["docs"]
+                    files.append(
                         {
-                            "type": "image",
-                            "url": image["url"],
+                            "docs": docs,
+                            "name": ", ".join(queries),
+                            "type": "web_search",
+                            "urls": results["filenames"],
+                            "queries": queries,
                         }
-                        for image in images
-                    ]
-                },
-            }
-        )
+                    )
 
-        system_message_content = "<context>User is shown the generated image, tell the user that the image has been generated</context>"
-    except Exception as e:
-        log.exception(e)
+                form_data["files"] = files
+
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "web_search",
+                            "description": "Searched {{count}} sites",
+                            "urls": results["filenames"],
+                            "items": results.get("items", []),
+                            "done": True,
+                        },
+                    }
+                )
+            else:
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "web_search",
+                            "description": "No search results found",
+                            "done": True,
+                            "error": True,
+                        },
+                    }
+                )
+
+        except Exception as e:
+            log.exception(e)
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "web_search",
+                        "description": "An error occurred while searching the web",
+                        "queries": queries,
+                        "done": True,
+                        "error": True,
+                    },
+                }
+            )
+
+        span.update(output={"success": True, "queries_count": len(queries), "files_added": len(form_data.get("files", []))})
+        return form_data
+
+
+async def chat_image_generation_handler(
+    request: Request, form_data: dict, extra_params: dict, user
+):
+    langfuse_client = get_langfuse_client()
+    with langfuse_client.start_as_current_span(name="chat-image-generation-handler") as span:
+        span.update(input={"user_id": user.id, "messages_count": len(form_data.get("messages", []))})
+        
+        __event_emitter__ = extra_params["__event_emitter__"]
         await __event_emitter__(
             {
                 "type": "status",
-                "data": {
-                    "description": f"An error occurred while generating an image",
-                    "done": True,
-                },
+                "data": {"description": "Creating image", "done": False},
             }
         )
 
-        system_message_content = "<context>Unable to generate an image, tell the user that an error occurred</context>"
+        messages = form_data["messages"]
+        user_message = get_last_user_message(messages)
 
-    if system_message_content:
-        form_data["messages"] = add_or_update_system_message(
-            system_message_content, form_data["messages"]
-        )
+        prompt = user_message
+        negative_prompt = ""
 
-    return form_data
+        if request.app.state.config.ENABLE_IMAGE_PROMPT_GENERATION:
+            try:
+                res = await generate_image_prompt(
+                    request,
+                    {
+                        "model": form_data["model"],
+                        "messages": messages,
+                    },
+                    user,
+                )
+
+                response = res["choices"][0]["message"]["content"]
+
+                try:
+                    bracket_start = response.find("{")
+                    bracket_end = response.rfind("}") + 1
+
+                    if bracket_start == -1 or bracket_end == -1:
+                        raise Exception("No JSON object found in the response")
+
+                    response = response[bracket_start:bracket_end]
+                    response = json.loads(response)
+                    prompt = response.get("prompt", [])
+                except Exception as e:
+                    prompt = user_message
+
+            except Exception as e:
+                log.exception(e)
+                prompt = user_message
+
+        system_message_content = ""
+        images_generated = 0
+
+        try:
+            images = await image_generations(
+                request=request,
+                form_data=GenerateImageForm(**{"prompt": prompt}),
+                user=user,
+            )
+            images_generated = len(images)
+
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {"description": "Image created", "done": True},
+                }
+            )
+
+            await __event_emitter__(
+                {
+                    "type": "files",
+                    "data": {
+                        "files": [
+                            {
+                                "type": "image",
+                                "url": image["url"],
+                            }
+                            for image in images
+                        ]
+                    },
+                }
+            )
+
+            system_message_content = "<context>User is shown the generated image, tell the user that the image has been generated</context>"
+        except Exception as e:
+            log.exception(e)
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"An error occurred while generating an image",
+                        "done": True,
+                    },
+                }
+            )
+
+            system_message_content = "<context>Unable to generate an image, tell the user that an error occurred</context>"
+
+        if system_message_content:
+            form_data["messages"] = add_or_update_system_message(
+                system_message_content, form_data["messages"]
+            )
+
+        span.update(output={"success": images_generated > 0, "images_generated": images_generated, "prompt_length": len(prompt)})
+        return form_data
 
 
 async def chat_completion_files_handler(
     request: Request, body: dict, extra_params: dict, user: UserModel
 ) -> tuple[dict, dict[str, list]]:
-    __event_emitter__ = extra_params["__event_emitter__"]
-    sources = []
-
-    if files := body.get("metadata", {}).get("files", None):
-        # Check if all files are in full context mode
-        all_full_context = all(item.get("context") == "full" for item in files)
-
+    langfuse_client = get_langfuse_client()
+    with langfuse_client.start_as_current_span(name="chat-completion-files-handler") as span:
+        __event_emitter__ = extra_params["__event_emitter__"]
+        sources = []
         queries = []
-        if not all_full_context:
-            try:
-                queries_response = await generate_queries(
-                    request,
-                    {
-                        "model": body["model"],
-                        "messages": body["messages"],
-                        "type": "retrieval",
-                    },
-                    user,
-                )
-                queries_response = queries_response["choices"][0]["message"]["content"]
 
+        if files := body.get("metadata", {}).get("files", None):
+            span.update(input={"files": files})
+            
+            # Check if all files are in full context mode
+            all_full_context = all(item.get("context") == "full" for item in files)
+
+            if not all_full_context:
                 try:
-                    bracket_start = queries_response.find("{")
-                    bracket_end = queries_response.rfind("}") + 1
+                    queries_response = await generate_queries(
+                        request,
+                        {
+                            "model": body["model"],
+                            "messages": body["messages"],
+                            "type": "retrieval",
+                        },
+                        user,
+                    )
+                    queries_response = queries_response["choices"][0]["message"]["content"]
 
-                    if bracket_start == -1 or bracket_end == -1:
-                        raise Exception("No JSON object found in the response")
+                    try:
+                        bracket_start = queries_response.find("{")
+                        bracket_end = queries_response.rfind("}") + 1
 
-                    queries_response = queries_response[bracket_start:bracket_end]
-                    queries_response = json.loads(queries_response)
-                except Exception as e:
-                    queries_response = {"queries": [queries_response]}
+                        if bracket_start == -1 or bracket_end == -1:
+                            raise Exception("No JSON object found in the response")
 
-                queries = queries_response.get("queries", [])
-            except:
-                pass
+                        queries_response = queries_response[bracket_start:bracket_end]
+                        queries_response = json.loads(queries_response)
+                    except Exception as e:
+                        queries_response = {"queries": [queries_response]}
 
-        if len(queries) == 0:
-            queries = [get_last_user_message(body["messages"])]
+                    queries = queries_response.get("queries", [])
+                except:
+                    pass
 
-        if not all_full_context:
+            if len(queries) == 0:
+                queries = [get_last_user_message(body["messages"])]
+
+            if not all_full_context:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "queries_generated",
+                            "queries": queries,
+                            "done": False,
+                        },
+                    }
+                )
+
+            try:
+                # Offload get_sources_from_items to a separate thread
+                loop = asyncio.get_running_loop()
+                with ThreadPoolExecutor() as executor:
+                    sources = await loop.run_in_executor(
+                        executor,
+                        lambda: get_sources_from_items(
+                            request=request,
+                            items=files,
+                            queries=queries,
+                            embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
+                                query, prefix=prefix, user=user
+                            ),
+                            k=request.app.state.config.TOP_K,
+                            reranking_function=(
+                                (
+                                    lambda sentences: request.app.state.RERANKING_FUNCTION(
+                                        sentences, user=user
+                                    )
+                                )
+                                if request.app.state.RERANKING_FUNCTION
+                                else None
+                            ),
+                            k_reranker=request.app.state.config.TOP_K_RERANKER,
+                            r=request.app.state.config.RELEVANCE_THRESHOLD,
+                            hybrid_bm25_weight=request.app.state.config.HYBRID_BM25_WEIGHT,
+                            hybrid_search=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
+                            full_context=all_full_context
+                            or request.app.state.config.RAG_FULL_CONTEXT,
+                            user=user,
+                        ),
+                    )
+            except Exception as e:
+                log.exception(e)
+
+            log.debug(f"rag_contexts:sources: {sources}")
+
+            unique_ids = set()
+
+            for source in sources or []:
+                if not source or len(source.keys()) == 0:
+                    continue
+
+                documents = source.get("document") or []
+                metadatas = source.get("metadata") or []
+                src_info = source.get("source") or {}
+
+                for index, _ in enumerate(documents):
+                    metadata = metadatas[index] if index < len(metadatas) else None
+                    _id = (
+                        (metadata or {}).get("source")
+                        or (src_info or {}).get("id")
+                        or "N/A"
+                    )
+                    unique_ids.add(_id)
+
+            sources_count = len(unique_ids)
+
             await __event_emitter__(
                 {
                     "type": "status",
                     "data": {
-                        "action": "queries_generated",
-                        "queries": queries,
-                        "done": False,
+                        "action": "sources_retrieved",
+                        "count": sources_count,
+                        "done": True,
                     },
                 }
             )
 
-        try:
-            # Offload get_sources_from_items to a separate thread
-            loop = asyncio.get_running_loop()
-            with ThreadPoolExecutor() as executor:
-                sources = await loop.run_in_executor(
-                    executor,
-                    lambda: get_sources_from_items(
-                        request=request,
-                        items=files,
-                        queries=queries,
-                        embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
-                            query, prefix=prefix, user=user
-                        ),
-                        k=request.app.state.config.TOP_K,
-                        reranking_function=(
-                            (
-                                lambda sentences: request.app.state.RERANKING_FUNCTION(
-                                    sentences, user=user
-                                )
-                            )
-                            if request.app.state.RERANKING_FUNCTION
-                            else None
-                        ),
-                        k_reranker=request.app.state.config.TOP_K_RERANKER,
-                        r=request.app.state.config.RELEVANCE_THRESHOLD,
-                        hybrid_bm25_weight=request.app.state.config.HYBRID_BM25_WEIGHT,
-                        hybrid_search=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
-                        full_context=all_full_context
-                        or request.app.state.config.RAG_FULL_CONTEXT,
-                        user=user,
-                    ),
-                )
-        except Exception as e:
-            log.exception(e)
-
-        log.debug(f"rag_contexts:sources: {sources}")
-
-        unique_ids = set()
-
-        for source in sources or []:
-            if not source or len(source.keys()) == 0:
-                continue
-
-            documents = source.get("document") or []
-            metadatas = source.get("metadata") or []
-            src_info = source.get("source") or {}
-
-            for index, _ in enumerate(documents):
-                metadata = metadatas[index] if index < len(metadatas) else None
-                _id = (
-                    (metadata or {}).get("source")
-                    or (src_info or {}).get("id")
-                    or "N/A"
-                )
-                unique_ids.add(_id)
-
-        sources_count = len(unique_ids)
-
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "action": "sources_retrieved",
-                    "count": sources_count,
-                    "done": True,
-                },
-            }
-        )
-
-    return body, {"sources": sources}
+        span.update(output={
+            "success": True,
+            "sources": sources,
+            "queries": queries,
+        })
+        return body, {"sources": sources}
 
 
 def apply_params_to_form_data(form_data, model):
@@ -815,420 +847,429 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # Pipeline Inlet -> Filter Inlet -> Chat Memory -> Chat Web Search -> Chat Image Generation
     # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
     # -> Chat Files
+    langfuse_client = get_langfuse_client()
+    with langfuse_client.start_as_current_span(name="process-chat-payload") as span:
+        span.update(input={**form_data})
 
-    form_data = apply_params_to_form_data(form_data, model)
-    log.debug(f"form_data: {form_data}")
+        form_data = apply_params_to_form_data(form_data, model)
+        log.debug(f"form_data: {form_data}")
 
-    system_message = get_system_message(form_data.get("messages", []))
-    if system_message:
+        system_message = get_system_message(form_data.get("messages", []))
+        if system_message:
+            try:
+                form_data = apply_system_prompt_to_body(
+                    system_message.get("content"), form_data, metadata, user
+                )
+            except:
+                pass
+
+        event_emitter = get_event_emitter(metadata)
+        event_call = get_event_call(metadata)
+
+        oauth_token = None
         try:
-            form_data = apply_system_prompt_to_body(
-                system_message.get("content"), form_data, metadata, user
-            )
-        except:
-            pass
+            if request.cookies.get("oauth_session_id", None):
+                oauth_token = await request.app.state.oauth_manager.get_oauth_token(
+                    user.id,
+                    request.cookies.get("oauth_session_id", None),
+                )
+        except Exception as e:
+            log.error(f"Error getting OAuth token: {e}")
 
-    event_emitter = get_event_emitter(metadata)
-    event_call = get_event_call(metadata)
-
-    oauth_token = None
-    try:
-        if request.cookies.get("oauth_session_id", None):
-            oauth_token = await request.app.state.oauth_manager.get_oauth_token(
-                user.id,
-                request.cookies.get("oauth_session_id", None),
-            )
-    except Exception as e:
-        log.error(f"Error getting OAuth token: {e}")
-
-    extra_params = {
-        "__event_emitter__": event_emitter,
-        "__event_call__": event_call,
-        "__user__": user.model_dump() if isinstance(user, UserModel) else {},
-        "__metadata__": metadata,
-        "__request__": request,
-        "__model__": model,
-        "__oauth_token__": oauth_token,
-    }
-
-    # Initialize events to store additional event to be sent to the client
-    # Initialize contexts and citation
-    if getattr(request.state, "direct", False) and hasattr(request.state, "model"):
-        models = {
-            request.state.model["id"]: request.state.model,
+        extra_params = {
+            "__event_emitter__": event_emitter,
+            "__event_call__": event_call,
+            "__user__": user.model_dump() if isinstance(user, UserModel) else {},
+            "__metadata__": metadata,
+            "__request__": request,
+            "__model__": model,
+            "__oauth_token__": oauth_token,
         }
-    else:
-        models = request.app.state.MODELS
 
-    task_model_id = get_task_model_id(
-        form_data["model"],
-        request.app.state.config.TASK_MODEL,
-        request.app.state.config.TASK_MODEL_EXTERNAL,
-        models,
-    )
-
-    events = []
-    sources = []
-
-    # Folder "Project" handling
-    # Check if the request has chat_id and is inside of a folder
-    chat_id = metadata.get("chat_id", None)
-    if chat_id and user:
-        chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
-        if chat and chat.folder_id:
-            folder = Folders.get_folder_by_id_and_user_id(chat.folder_id, user.id)
-
-            if folder and folder.data:
-                if "system_prompt" in folder.data:
-                    form_data = apply_system_prompt_to_body(
-                        folder.data["system_prompt"], form_data, metadata, user
-                    )
-                if "files" in folder.data:
-                    form_data["files"] = [
-                        *folder.data["files"],
-                        *form_data.get("files", []),
-                    ]
-
-    # Model "Knowledge" handling
-    user_message = get_last_user_message(form_data["messages"])
-    model_knowledge = model.get("info", {}).get("meta", {}).get("knowledge", False)
-
-    if model_knowledge:
-        await event_emitter(
-            {
-                "type": "status",
-                "data": {
-                    "action": "knowledge_search",
-                    "query": user_message,
-                    "done": False,
-                },
+        # Initialize events to store additional event to be sent to the client
+        # Initialize contexts and citation
+        if getattr(request.state, "direct", False) and hasattr(request.state, "model"):
+            models = {
+                request.state.model["id"]: request.state.model,
             }
+        else:
+            models = request.app.state.MODELS
+
+        task_model_id = get_task_model_id(
+            form_data["model"],
+            request.app.state.config.TASK_MODEL,
+            request.app.state.config.TASK_MODEL_EXTERNAL,
+            models,
         )
 
-        knowledge_files = []
-        for item in model_knowledge:
-            if item.get("collection_name"):
-                knowledge_files.append(
-                    {
-                        "id": item.get("collection_name"),
-                        "name": item.get("name"),
-                        "legacy": True,
-                    }
-                )
-            elif item.get("collection_names"):
-                knowledge_files.append(
-                    {
-                        "name": item.get("name"),
-                        "type": "collection",
-                        "collection_names": item.get("collection_names"),
-                        "legacy": True,
-                    }
-                )
-            else:
-                knowledge_files.append(item)
+        events = []
+        sources = []
 
-        files = form_data.get("files", [])
-        files.extend(knowledge_files)
-        form_data["files"] = files
+        # Folder "Project" handling
+        # Check if the request has chat_id and is inside of a folder
+        chat_id = metadata.get("chat_id", None)
+        if chat_id and user:
+            chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+            if chat and chat.folder_id:
+                folder = Folders.get_folder_by_id_and_user_id(chat.folder_id, user.id)
 
-    variables = form_data.pop("variables", None)
-
-    # Process the form_data through the pipeline
-    try:
-        form_data = await process_pipeline_inlet_filter(
-            request, form_data, user, models
-        )
-    except Exception as e:
-        raise e
-
-    try:
-        filter_functions = [
-            Functions.get_function_by_id(filter_id)
-            for filter_id in get_sorted_filter_ids(
-                request, model, metadata.get("filter_ids", [])
-            )
-        ]
-
-        form_data, flags = await process_filter_functions(
-            request=request,
-            filter_functions=filter_functions,
-            filter_type="inlet",
-            form_data=form_data,
-            extra_params=extra_params,
-        )
-    except Exception as e:
-        raise Exception(f"{e}")
-
-    features = form_data.pop("features", None)
-    if features:
-        if "memory" in features and features["memory"]:
-            form_data = await chat_memory_handler(
-                request, form_data, extra_params, user
-            )
-
-        if "web_search" in features and features["web_search"]:
-            form_data = await chat_web_search_handler(
-                request, form_data, extra_params, user
-            )
-
-        if "image_generation" in features and features["image_generation"]:
-            form_data = await chat_image_generation_handler(
-                request, form_data, extra_params, user
-            )
-
-        if "code_interpreter" in features and features["code_interpreter"]:
-            form_data["messages"] = add_or_update_user_message(
-                (
-                    request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE
-                    if request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE != ""
-                    else DEFAULT_CODE_INTERPRETER_PROMPT
-                ),
-                form_data["messages"],
-            )
-
-    tool_ids = form_data.pop("tool_ids", None)
-    files = form_data.pop("files", None)
-
-    # Remove files duplicates
-    if files:
-        files = list({json.dumps(f, sort_keys=True): f for f in files}.values())
-
-    metadata = {
-        **metadata,
-        "tool_ids": tool_ids,
-        "files": files,
-    }
-    form_data["metadata"] = metadata
-
-    # Server side tools
-    tool_ids = metadata.get("tool_ids", None)
-    # Client side tools
-    direct_tool_servers = metadata.get("tool_servers", None)
-
-    log.debug(f"{tool_ids=}")
-    log.debug(f"{direct_tool_servers=}")
-
-    tools_dict = {}
-
-    mcp_clients = []
-    mcp_tools_dict = {}
-
-    if tool_ids:
-        for tool_id in tool_ids:
-            if tool_id.startswith("server:mcp:"):
-                try:
-                    server_id = tool_id[len("server:mcp:") :]
-
-                    mcp_server_connection = None
-                    for (
-                        server_connection
-                    ) in request.app.state.config.TOOL_SERVER_CONNECTIONS:
-                        if (
-                            server_connection.get("type", "") == "mcp"
-                            and server_connection.get("info", {}).get("id") == server_id
-                        ):
-                            mcp_server_connection = server_connection
-                            break
-
-                    if not mcp_server_connection:
-                        log.error(f"MCP server with id {server_id} not found")
-                        continue
-
-                    auth_type = mcp_server_connection.get("auth_type", "")
-
-                    headers = {}
-                    if auth_type == "bearer":
-                        headers["Authorization"] = (
-                            f"Bearer {mcp_server_connection.get('key', '')}"
+                if folder and folder.data:
+                    if "system_prompt" in folder.data:
+                        form_data = apply_system_prompt_to_body(
+                            folder.data["system_prompt"], form_data, metadata, user
                         )
-                    elif auth_type == "none":
-                        # No authentication
-                        pass
-                    elif auth_type == "session":
-                        headers["Authorization"] = (
-                            f"Bearer {request.state.token.credentials}"
-                        )
-                    elif auth_type == "system_oauth":
-                        oauth_token = extra_params.get("__oauth_token__", None)
-                        if oauth_token:
+                    if "files" in folder.data:
+                        form_data["files"] = [
+                            *folder.data["files"],
+                            *form_data.get("files", []),
+                        ]
+
+        # Model "Knowledge" handling
+        user_message = get_last_user_message(form_data["messages"])
+        model_knowledge = model.get("info", {}).get("meta", {}).get("knowledge", False)
+
+        if model_knowledge:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "knowledge_search",
+                        "query": user_message,
+                        "done": False,
+                    },
+                }
+            )
+
+            knowledge_files = []
+            for item in model_knowledge:
+                if item.get("collection_name"):
+                    knowledge_files.append(
+                        {
+                            "id": item.get("collection_name"),
+                            "name": item.get("name"),
+                            "legacy": True,
+                        }
+                    )
+                elif item.get("collection_names"):
+                    knowledge_files.append(
+                        {
+                            "name": item.get("name"),
+                            "type": "collection",
+                            "collection_names": item.get("collection_names"),
+                            "legacy": True,
+                        }
+                    )
+                else:
+                    knowledge_files.append(item)
+
+            files = form_data.get("files", [])
+            files.extend(knowledge_files)
+            form_data["files"] = files
+
+        variables = form_data.pop("variables", None)
+
+        # Process the form_data through the pipeline
+        try:
+            form_data = await process_pipeline_inlet_filter(
+                request, form_data, user, models
+            )
+        except Exception as e:
+            raise e
+
+        try:
+            filter_functions = [
+                Functions.get_function_by_id(filter_id)
+                for filter_id in get_sorted_filter_ids(
+                    request, model, metadata.get("filter_ids", [])
+                )
+            ]
+
+            form_data, flags = await process_filter_functions(
+                request=request,
+                filter_functions=filter_functions,
+                filter_type="inlet",
+                form_data=form_data,
+                extra_params=extra_params,
+            )
+        except Exception as e:
+            raise Exception(f"{e}")
+
+        features = form_data.pop("features", None)
+        if features:
+            if "memory" in features and features["memory"]:
+                form_data = await chat_memory_handler(
+                    request, form_data, extra_params, user
+                )
+        
+            experimental_mode_enabled = form_data.get("experimentalModeEnabled", False)
+            if experimental_mode_enabled:
+                print("Experimental mode enabled")
+
+            if "web_search" in features and features["web_search"]:
+                form_data = await chat_web_search_handler(
+                    request, form_data, extra_params, user
+                )
+
+            if "image_generation" in features and features["image_generation"]:
+                form_data = await chat_image_generation_handler(
+                    request, form_data, extra_params, user
+                )
+
+            if "code_interpreter" in features and features["code_interpreter"]:
+                form_data["messages"] = add_or_update_user_message(
+                    (
+                        request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE
+                        if request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE != ""
+                        else DEFAULT_CODE_INTERPRETER_PROMPT
+                    ),
+                    form_data["messages"],
+                )
+
+        tool_ids = form_data.pop("tool_ids", None)
+        files = form_data.pop("files", None)
+
+        # Remove files duplicates
+        if files:
+            files = list({json.dumps(f, sort_keys=True): f for f in files}.values())
+
+        metadata = {
+            **metadata,
+            "tool_ids": tool_ids,
+            "files": files,
+        }
+        form_data["metadata"] = metadata
+
+        # Server side tools
+        tool_ids = metadata.get("tool_ids", None)
+        # Client side tools
+        direct_tool_servers = metadata.get("tool_servers", None)
+
+        log.debug(f"{tool_ids=}")
+        log.debug(f"{direct_tool_servers=}")
+
+        tools_dict = {}
+
+        mcp_clients = []
+        mcp_tools_dict = {}
+
+        if tool_ids:
+            for tool_id in tool_ids:
+                if tool_id.startswith("server:mcp:"):
+                    try:
+                        server_id = tool_id[len("server:mcp:") :]
+
+                        mcp_server_connection = None
+                        for (
+                            server_connection
+                        ) in request.app.state.config.TOOL_SERVER_CONNECTIONS:
+                            if (
+                                server_connection.get("type", "") == "mcp"
+                                and server_connection.get("info", {}).get("id") == server_id
+                            ):
+                                mcp_server_connection = server_connection
+                                break
+
+                        if not mcp_server_connection:
+                            log.error(f"MCP server with id {server_id} not found")
+                            continue
+
+                        auth_type = mcp_server_connection.get("auth_type", "")
+
+                        headers = {}
+                        if auth_type == "bearer":
                             headers["Authorization"] = (
-                                f"Bearer {oauth_token.get('access_token', '')}"
+                                f"Bearer {mcp_server_connection.get('key', '')}"
                             )
-                    elif auth_type == "oauth_2.1":
-                        try:
-                            splits = server_id.split(":")
-                            server_id = splits[-1] if len(splits) > 1 else server_id
-
-                            oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
-                                user.id, f"mcp:{server_id}"
+                        elif auth_type == "none":
+                            # No authentication
+                            pass
+                        elif auth_type == "session":
+                            headers["Authorization"] = (
+                                f"Bearer {request.state.token.credentials}"
                             )
-
+                        elif auth_type == "system_oauth":
+                            oauth_token = extra_params.get("__oauth_token__", None)
                             if oauth_token:
                                 headers["Authorization"] = (
                                     f"Bearer {oauth_token.get('access_token', '')}"
                                 )
-                        except Exception as e:
-                            log.error(f"Error getting OAuth token: {e}")
-                            oauth_token = None
+                        elif auth_type == "oauth_2.1":
+                            try:
+                                splits = server_id.split(":")
+                                server_id = splits[-1] if len(splits) > 1 else server_id
 
-                    mcp_client = MCPClient()
-                    await mcp_client.connect(
-                        url=mcp_server_connection.get("url", ""),
-                        headers=headers if headers else None,
-                    )
-
-                    tool_specs = await mcp_client.list_tool_specs()
-                    for tool_spec in tool_specs:
-
-                        def make_tool_function(function_name):
-                            async def tool_function(**kwargs):
-                                return await mcp_client.call_tool(
-                                    function_name,
-                                    function_args=kwargs,
+                                oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
+                                    user.id, f"mcp:{server_id}"
                                 )
 
-                            return tool_function
+                                if oauth_token:
+                                    headers["Authorization"] = (
+                                        f"Bearer {oauth_token.get('access_token', '')}"
+                                    )
+                            except Exception as e:
+                                log.error(f"Error getting OAuth token: {e}")
+                                oauth_token = None
 
-                        tool_function = make_tool_function(tool_spec["name"])
+                        mcp_client = MCPClient()
+                        await mcp_client.connect(
+                            url=mcp_server_connection.get("url", ""),
+                            headers=headers if headers else None,
+                        )
 
-                        mcp_tools_dict[tool_spec["name"]] = {
-                            "spec": tool_spec,
-                            "callable": tool_function,
-                            "type": "mcp",
-                            "client": mcp_client,
-                            "direct": False,
-                        }
+                        tool_specs = await mcp_client.list_tool_specs()
+                        for tool_spec in tool_specs:
 
-                    mcp_clients.append(mcp_client)
+                            def make_tool_function(function_name):
+                                async def tool_function(**kwargs):
+                                    return await mcp_client.call_tool(
+                                        function_name,
+                                        function_args=kwargs,
+                                    )
+
+                                return tool_function
+
+                            tool_function = make_tool_function(tool_spec["name"])
+
+                            mcp_tools_dict[tool_spec["name"]] = {
+                                "spec": tool_spec,
+                                "callable": tool_function,
+                                "type": "mcp",
+                                "client": mcp_client,
+                                "direct": False,
+                            }
+
+                        mcp_clients.append(mcp_client)
+                    except Exception as e:
+                        log.debug(e)
+                        continue
+
+            tools_dict = await get_tools(
+                request,
+                tool_ids,
+                user,
+                {
+                    **extra_params,
+                    "__model__": models[task_model_id],
+                    "__messages__": form_data["messages"],
+                    "__files__": metadata.get("files", []),
+                },
+            )
+            if mcp_tools_dict:
+                tools_dict = {**tools_dict, **mcp_tools_dict}
+
+        if direct_tool_servers:
+            for tool_server in direct_tool_servers:
+                tool_specs = tool_server.pop("specs", [])
+
+                for tool in tool_specs:
+                    tools_dict[tool["name"]] = {
+                        "spec": tool,
+                        "direct": True,
+                        "server": tool_server,
+                    }
+
+        if mcp_clients:
+            metadata["mcp_clients"] = mcp_clients
+
+        if tools_dict:
+            if metadata.get("params", {}).get("function_calling") == "native":
+                # If the function calling is native, then call the tools function calling handler
+                metadata["tools"] = tools_dict
+                form_data["tools"] = [
+                    {"type": "function", "function": tool.get("spec", {})}
+                    for tool in tools_dict.values()
+                ]
+
+            else:
+                # If the function calling is not native, then call the tools function calling handler
+                try:
+                    form_data, flags = await chat_completion_tools_handler(
+                        request, form_data, extra_params, user, models, tools_dict
+                    )
+                    sources.extend(flags.get("sources", []))
                 except Exception as e:
-                    log.debug(e)
-                    continue
+                    log.exception(e)
 
-        tools_dict = await get_tools(
-            request,
-            tool_ids,
-            user,
-            {
-                **extra_params,
-                "__model__": models[task_model_id],
-                "__messages__": form_data["messages"],
-                "__files__": metadata.get("files", []),
-            },
-        )
-        if mcp_tools_dict:
-            tools_dict = {**tools_dict, **mcp_tools_dict}
+        try:
+            form_data, flags = await chat_completion_files_handler(
+                request, form_data, extra_params, user
+            )
+            sources.extend(flags.get("sources", []))
+        except Exception as e:
+            log.exception(e)
 
-    if direct_tool_servers:
-        for tool_server in direct_tool_servers:
-            tool_specs = tool_server.pop("specs", [])
+        # If context is not empty, insert it into the messages
+        if len(sources) > 0:
+            context_string = ""
+            citation_idx_map = {}
 
-            for tool in tool_specs:
-                tools_dict[tool["name"]] = {
-                    "spec": tool,
-                    "direct": True,
-                    "server": tool_server,
-                }
+            for source in sources:
+                is_tool_result = source.get("tool_result", False)
 
-    if mcp_clients:
-        metadata["mcp_clients"] = mcp_clients
+                if "document" in source and not is_tool_result:
+                    for document_text, document_metadata in zip(
+                        source["document"], source["metadata"]
+                    ):
+                        source_name = source.get("source", {}).get("name", None)
+                        source_id = (
+                            document_metadata.get("source", None)
+                            or source.get("source", {}).get("id", None)
+                            or "N/A"
+                        )
 
-    if tools_dict:
-        if metadata.get("params", {}).get("function_calling") == "native":
-            # If the function calling is native, then call the tools function calling handler
-            metadata["tools"] = tools_dict
-            form_data["tools"] = [
-                {"type": "function", "function": tool.get("spec", {})}
-                for tool in tools_dict.values()
-            ]
+                        if source_id not in citation_idx_map:
+                            citation_idx_map[source_id] = len(citation_idx_map) + 1
 
-        else:
-            # If the function calling is not native, then call the tools function calling handler
-            try:
-                form_data, flags = await chat_completion_tools_handler(
-                    request, form_data, extra_params, user, models, tools_dict
+                        context_string += (
+                            f'<source id="{citation_idx_map[source_id]}"'
+                            + (f' name="{source_name}"' if source_name else "")
+                            + f">{document_text}</source>\n"
+                        )
+
+            context_string = context_string.strip()
+
+            prompt = get_last_user_message(form_data["messages"])
+            if prompt is None:
+                raise Exception("No user message found")
+
+            if context_string != "":
+                form_data["messages"] = add_or_update_user_message(
+                    rag_template(
+                        request.app.state.config.RAG_TEMPLATE,
+                        context_string,
+                        prompt,
+                    ),
+                    form_data["messages"],
+                    append=False,
                 )
-                sources.extend(flags.get("sources", []))
-            except Exception as e:
-                log.exception(e)
 
-    try:
-        form_data, flags = await chat_completion_files_handler(
-            request, form_data, extra_params, user
-        )
-        sources.extend(flags.get("sources", []))
-    except Exception as e:
-        log.exception(e)
+        # If there are citations, add them to the data_items
+        sources = [
+            source
+            for source in sources
+            if source.get("source", {}).get("name", "")
+            or source.get("source", {}).get("id", "")
+        ]
 
-    # If context is not empty, insert it into the messages
-    if len(sources) > 0:
-        context_string = ""
-        citation_idx_map = {}
+        if len(sources) > 0:
+            events.append({"sources": sources})
 
-        for source in sources:
-            is_tool_result = source.get("tool_result", False)
-
-            if "document" in source and not is_tool_result:
-                for document_text, document_metadata in zip(
-                    source["document"], source["metadata"]
-                ):
-                    source_name = source.get("source", {}).get("name", None)
-                    source_id = (
-                        document_metadata.get("source", None)
-                        or source.get("source", {}).get("id", None)
-                        or "N/A"
-                    )
-
-                    if source_id not in citation_idx_map:
-                        citation_idx_map[source_id] = len(citation_idx_map) + 1
-
-                    context_string += (
-                        f'<source id="{citation_idx_map[source_id]}"'
-                        + (f' name="{source_name}"' if source_name else "")
-                        + f">{document_text}</source>\n"
-                    )
-
-        context_string = context_string.strip()
-
-        prompt = get_last_user_message(form_data["messages"])
-        if prompt is None:
-            raise Exception("No user message found")
-
-        if context_string != "":
-            form_data["messages"] = add_or_update_user_message(
-                rag_template(
-                    request.app.state.config.RAG_TEMPLATE,
-                    context_string,
-                    prompt,
-                ),
-                form_data["messages"],
-                append=False,
+        if model_knowledge:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "knowledge_search",
+                        "query": user_message,
+                        "done": True,
+                        "hidden": True,
+                    },
+                }
             )
 
-    # If there are citations, add them to the data_items
-    sources = [
-        source
-        for source in sources
-        if source.get("source", {}).get("name", "")
-        or source.get("source", {}).get("id", "")
-    ]
+        span.update(output={**form_data, "events": events})
 
-    if len(sources) > 0:
-        events.append({"sources": sources})
-
-    if model_knowledge:
-        await event_emitter(
-            {
-                "type": "status",
-                "data": {
-                    "action": "knowledge_search",
-                    "query": user_message,
-                    "done": True,
-                    "hidden": True,
-                },
-            }
-        )
-
-    return form_data, metadata, events
+        return form_data, metadata, events
 
 
 async def process_chat_response(
@@ -2900,6 +2941,7 @@ async def process_chat_response(
                     "done": True,
                     "content": serialize_content_blocks(content_blocks),
                     "title": title,
+                    "trace_url": metadata.get("trace_url"),  # Include trace URL in response
                 }
 
                 if not ENABLE_REALTIME_CHAT_SAVE:

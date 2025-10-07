@@ -744,6 +744,14 @@ OTEL_METRICS_EXPORTER_OTLP_ENDPOINT = os.environ.get(
 OTEL_LOGS_EXPORTER_OTLP_ENDPOINT = os.environ.get(
     "OTEL_LOGS_EXPORTER_OTLP_ENDPOINT", OTEL_EXPORTER_OTLP_ENDPOINT
 )
+
+####################################
+# LANGFUSE
+####################################
+
+LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
+LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
 OTEL_EXPORTER_OTLP_INSECURE = (
     os.environ.get("OTEL_EXPORTER_OTLP_INSECURE", "False").lower() == "true"
 )

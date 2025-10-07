@@ -127,6 +127,7 @@
 	let imageGenerationEnabled = false;
 	let webSearchEnabled = false;
 	let codeInterpreterEnabled = false;
+	let experimentalModeEnabled = false;
 
 	let showCommands = false;
 
@@ -1266,7 +1267,7 @@
 	};
 
 	const chatCompletionEventHandler = async (data, message, chatId) => {
-		const { id, done, choices, content, sources, selected_model_id, error, usage } = data;
+		const { id, done, choices, content, sources, selected_model_id, error, usage, trace_url } = data;
 
 		if (error) {
 			await handleOpenAIError(error, message);
@@ -1274,6 +1275,10 @@
 
 		if (sources && !message?.sources) {
 			message.sources = sources;
+		}
+
+		if (trace_url && !message?.trace_url) {
+			message.trace_url = trace_url;
 		}
 
 		if (choices) {
@@ -1827,6 +1832,7 @@
 					...getPromptVariables($user?.name, $settings?.userLocation ? userLocation : undefined)
 				},
 				model_item: $models.find((m) => m.id === model.id),
+				experimentalModeEnabled: experimentalModeEnabled,
 
 				session_id: $socket?.id,
 				chat_id: $chatId,
@@ -2393,6 +2399,7 @@
 									bind:imageGenerationEnabled
 									bind:codeInterpreterEnabled
 									bind:webSearchEnabled
+									bind:experimentalModeEnabled
 									bind:atSelectedModel
 									bind:showCommands
 									toolServers={$toolServers}
@@ -2445,6 +2452,7 @@
 									bind:imageGenerationEnabled
 									bind:codeInterpreterEnabled
 									bind:webSearchEnabled
+									bind:experimentalModeEnabled
 									bind:atSelectedModel
 									bind:showCommands
 									toolServers={$toolServers}

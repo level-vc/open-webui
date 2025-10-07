@@ -504,12 +504,23 @@ logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
+# External telemetry
 import sentry_sdk
+from open_webui.utils.langfuse_utils import get_langfuse_client
+
+def traces_sampler(sampling_context):
+    """
+    Custom traces sampler that keeps all error traces while sampling successful ones.
+    """
+    if sampling_context.get("has_error", False):
+        return 1.0
+    
+    return 0.1
 
 sentry_sdk.init(
     dsn="https://5960f10a9a5ab30f6e855162e5b2e8b9@o4509033024847872.ingest.us.sentry.io/4510081988820992",
     send_default_pii=True,
-    traces_sample_rate=1.0,
+    traces_sampler=traces_sampler,
 )
 
 class SPAStaticFiles(StaticFiles):
@@ -1500,70 +1511,86 @@ async def chat_completion(
         )
 
     async def process_chat(request, form_data, user, metadata, model):
-        try:
-            form_data, metadata, events = await process_chat_payload(
-                request, form_data, user, metadata, model
-            )
-
-            response = await chat_completion_handler(request, form_data, user)
-            if metadata.get("chat_id") and metadata.get("message_id"):
-                try:
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
-                        metadata["chat_id"],
-                        metadata["message_id"],
-                        {
-                            "model": model_id,
-                        },
-                    )
-                except:
-                    pass
-
-            return await process_chat_response(
-                request, response, form_data, user, metadata, model, events, tasks
-            )
-        except asyncio.CancelledError:
-            log.info("Chat processing was cancelled")
+        langfuse_client = get_langfuse_client()
+        with langfuse_client.start_as_current_span(name="level-chat") as span:
             try:
-                event_emitter = get_event_emitter(metadata)
-                await event_emitter(
-                    {"type": "chat:tasks:cancel"},
-                )
-            except Exception as e:
-                pass
-        except Exception as e:
-            log.debug(f"Error processing chat payload: {e}")
-            if metadata.get("chat_id") and metadata.get("message_id"):
-                # Update the chat message with the error
-                try:
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
-                        metadata["chat_id"],
-                        metadata["message_id"],
-                        {
-                            "error": {"content": str(e)},
-                        },
-                    )
+                span.update_trace(user_id=user.email)
+                span.update(input={ **model })
+                
+                # Get trace URL for the response metadata
+                from open_webui.utils.langfuse_utils import get_trace_url_from_span
+                trace_url = get_trace_url_from_span(span)
+                
+                # Add trace URL to metadata
+                if trace_url:
+                    metadata["trace_url"] = trace_url
 
+                form_data, metadata, events = await process_chat_payload(
+                    request, form_data, user, metadata, model
+                )
+
+                response = await chat_completion_handler(request, form_data, user)
+                if metadata.get("chat_id") and metadata.get("message_id"):
+                    try:
+                        Chats.upsert_message_to_chat_by_id_and_message_id(
+                            metadata["chat_id"],
+                            metadata["message_id"],
+                            {
+                                "model": model_id,
+                                "trace_url": trace_url,  # Store trace URL in message
+                            },
+                        )
+                    except:
+                        pass
+
+                return await process_chat_response(
+                    request, response, form_data, user, metadata, model, events, tasks
+                )
+
+            except asyncio.CancelledError:
+                log.info("Chat processing was cancelled")
+                try:
                     event_emitter = get_event_emitter(metadata)
-                    await event_emitter(
-                        {
-                            "type": "chat:message:error",
-                            "data": {"error": {"content": str(e)}},
-                        }
-                    )
                     await event_emitter(
                         {"type": "chat:tasks:cancel"},
                     )
-
-                except:
+                except Exception as e:
                     pass
-        finally:
-            try:
-                if mcp_clients := metadata.get("mcp_clients"):
-                    for client in mcp_clients:
-                        await client.disconnect()
             except Exception as e:
-                log.debug(f"Error cleaning up: {e}")
-                pass
+                log.debug(f"Error processing chat payload: {e}")
+                if metadata.get("chat_id") and metadata.get("message_id"):
+                    # Update the chat message with the error
+                    try:
+                        Chats.upsert_message_to_chat_by_id_and_message_id(
+                            metadata["chat_id"],
+                            metadata["message_id"],
+                            {
+                                "error": {"content": str(e)},
+                            },
+                        )
+
+                        event_emitter = get_event_emitter(metadata)
+                        await event_emitter(
+                            {
+                                "type": "chat:message:error",
+                                "data": {"error": {"content": str(e)}},
+                            }
+                        )
+                        await event_emitter(
+                            {"type": "chat:tasks:cancel"},
+                        )
+
+                    except:
+                        pass
+            finally:
+                langfuse_client.flush()
+                try:
+                    if mcp_clients := metadata.get("mcp_clients"):
+                        for client in mcp_clients:
+                            await client.disconnect()
+                except Exception as e:
+                    log.debug(f"Error cleaning up: {e}")
+                    pass
 
     if (
         metadata.get("session_id")

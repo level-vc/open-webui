@@ -70,6 +70,7 @@
 	import InputVariablesModal from './MessageInput/InputVariablesModal.svelte';
 	import Voice from '../icons/Voice.svelte';
 	import Terminal from '../icons/Terminal.svelte';
+	import Beaker from '../icons/Beaker.svelte';
 	import IntegrationsMenu from './MessageInput/IntegrationsMenu.svelte';
 	import Component from '../icons/Component.svelte';
 	import PlusAlt from '../icons/PlusAlt.svelte';
@@ -106,6 +107,7 @@
 	export let imageGenerationEnabled = false;
 	export let webSearchEnabled = false;
 	export let codeInterpreterEnabled = false;
+	export let experimentalModeEnabled = false;
 
 	let showInputVariablesModal = false;
 	let inputVariablesModalCallback = (variableValues) => {};
@@ -463,6 +465,9 @@
 			codeInterpreterCapableModels.length &&
 		$config?.features?.enable_code_interpreter &&
 		($_user.role === 'admin' || $_user?.permissions?.features?.code_interpreter);
+
+	let showExperimentalModeButton = false;
+	$: showExperimentalModeButton = true; // Always show experimental mode toggle
 
 	const scrollToBottom = () => {
 		const element = document.getElementById('messages-container');
@@ -1427,18 +1432,20 @@
 											class="flex self-center w-[1px] h-4 mx-1 bg-gray-200/50 dark:bg-gray-800/50"
 										/>
 
-										{#if showWebSearchButton || showImageGenerationButton || showCodeInterpreterButton || showToolsButton || (toggleFilters && toggleFilters.length > 0)}
+										{#if showWebSearchButton || showImageGenerationButton || showCodeInterpreterButton || showExperimentalModeButton || showToolsButton || (toggleFilters && toggleFilters.length > 0)}
 											<IntegrationsMenu
 												selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
 												{toggleFilters}
 												{showWebSearchButton}
 												{showImageGenerationButton}
 												{showCodeInterpreterButton}
+												{showExperimentalModeButton}
 												bind:selectedToolIds
 												bind:selectedFilterIds
 												bind:webSearchEnabled
 												bind:imageGenerationEnabled
 												bind:codeInterpreterEnabled
+												bind:experimentalModeEnabled
 												onClose={async () => {
 													await tick();
 
@@ -1572,6 +1579,32 @@
 															: 'focus:outline-hidden rounded-full'}"
 													>
 														<Terminal className="size-3.5" strokeWidth="2" />
+
+														<div class="hidden group-hover:block">
+															<XMark className="size-4" strokeWidth="1.75" />
+														</div>
+													</button>
+												</Tooltip>
+											{/if}
+
+											{#if experimentalModeEnabled}
+												<Tooltip content={$i18n.t('Experimental Mode')} placement="top">
+													<button
+														aria-label={experimentalModeEnabled
+															? $i18n.t('Disable Experimental Mode')
+															: $i18n.t('Enable Experimental Mode')}
+														aria-pressed={experimentalModeEnabled}
+														on:click|preventDefault={() =>
+															(experimentalModeEnabled = !experimentalModeEnabled)}
+														type="button"
+														class=" group p-[7px] flex gap-1.5 items-center text-sm transition-colors duration-300 max-w-full overflow-hidden hover:bg-gray-50 dark:hover:bg-gray-800 {experimentalModeEnabled
+															? ' text-sky-500 dark:text-sky-300 bg-sky-50 dark:bg-sky-400/10 border border-sky-200/40 dark:border-sky-500/20'
+															: 'bg-transparent text-gray-600 dark:text-gray-300 '} {($settings?.highContrastMode ??
+														false)
+															? 'm-1'
+															: 'focus:outline-hidden rounded-full'}"
+													>
+														<Beaker className="size-3.5" strokeWidth="2" />
 
 														<div class="hidden group-hover:block">
 															<XMark className="size-4" strokeWidth="1.75" />

@@ -1,11 +1,14 @@
 services:
-open-webui:
-    image: ghcr.io/open-webui/open-webui:${WEBUI_DOCKER_TAG:-main}
+  open-webui:
+    build: .
+    image: open-webui:local
     container_name: open-webui-standalone
     ports:
       - "3000:8080"
     volumes:
       - open-webui-data:/app/backend/data
+    env_file:
+      - .env
     environment:
       - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
@@ -22,15 +25,15 @@ open-webui:
       - OAUTH_SCOPES=${OAUTH_SCOPES}
       - ENABLE_LOGIN_FORM=${ENABLE_LOGIN_FORM}
       - ENABLE_OLLAMA_API=false
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - VECTOR_DB=${VECTOR_DB}
+      - PGVECTOR_DB_URL=${PGVECTOR_DB_URL}
 
       - MCP_ENABLE=true
               
     restart: unless-stopped
-    extra_hosts:
-      - host.docker.internal:host-gateway
-    depends_on:
-      mcp-proxy:
-        condition: service_healthy
+    network_mode: "host"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
