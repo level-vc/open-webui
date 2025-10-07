@@ -12,6 +12,7 @@ import asyncio
 
 from fastapi import Request, status
 from starlette.responses import Response, StreamingResponse, JSONResponse
+from open_webui.utils.langfuse_utils import get_langfuse_client
 
 
 from open_webui.models.users import UserModel
@@ -195,96 +196,138 @@ async def generate_chat_completion(
 
     model = models[model_id]
 
-    if getattr(request.state, "direct", False):
-        return await generate_direct_chat_completion(
-            request, form_data, user=user, models=models
-        )
-    else:
-        # Check if user has access to the model
-        if not bypass_filter and user.role == "user":
-            try:
-                check_model_access(user, model)
-            except Exception as e:
-                raise e
-
-        if model.get("owned_by") == "arena":
-            model_ids = model.get("info", {}).get("meta", {}).get("model_ids")
-            filter_mode = model.get("info", {}).get("meta", {}).get("filter_mode")
-            if model_ids and filter_mode == "exclude":
-                model_ids = [
-                    model["id"]
-                    for model in list(request.app.state.MODELS.values())
-                    if model.get("owned_by") != "arena" and model["id"] not in model_ids
-                ]
-
-            selected_model_id = None
-            if isinstance(model_ids, list) and model_ids:
-                selected_model_id = random.choice(model_ids)
-            else:
-                model_ids = [
-                    model["id"]
-                    for model in list(request.app.state.MODELS.values())
-                    if model.get("owned_by") != "arena"
-                ]
-                selected_model_id = random.choice(model_ids)
-
-            form_data["model"] = selected_model_id
-
-            if form_data.get("stream") == True:
-
-                async def stream_wrapper(stream):
-                    yield f"data: {json.dumps({'selected_model_id': selected_model_id})}\n\n"
-                    async for chunk in stream:
-                        yield chunk
-
-                response = await generate_chat_completion(
-                    request, form_data, user, bypass_filter=True
-                )
-                return StreamingResponse(
-                    stream_wrapper(response.body_iterator),
-                    media_type="text/event-stream",
-                    background=response.background,
+    # Initialize Langfuse client and start generation tracking
+    langfuse_client = get_langfuse_client()
+    
+    # Prepare generation input data
+    generation_input = {
+        "model": model_id,
+        "messages": form_data.get("messages", []),
+        "temperature": form_data.get("temperature"),
+        "max_tokens": form_data.get("max_tokens"),
+        "stream": form_data.get("stream", False)
+    }
+    
+    with langfuse_client.start_as_current_generation(
+        name=f"chat_completion_{model_id}",
+        input=generation_input,
+        model=model_id
+    ) as generation:
+        try:
+            if getattr(request.state, "direct", False):
+                response = await generate_direct_chat_completion(
+                    request, form_data, user=user, models=models
                 )
             else:
-                return {
-                    **(
-                        await generate_chat_completion(
+                # Check if user has access to the model
+                if not bypass_filter and user.role == "user":
+                    try:
+                        check_model_access(user, model)
+                    except Exception as e:
+                        generation.update(status="error", error=str(e))
+                        raise e
+
+                if model.get("owned_by") == "arena":
+                    model_ids = model.get("info", {}).get("meta", {}).get("model_ids")
+                    filter_mode = model.get("info", {}).get("meta", {}).get("filter_mode")
+                    if model_ids and filter_mode == "exclude":
+                        model_ids = [
+                            model["id"]
+                            for model in list(request.app.state.MODELS.values())
+                            if model.get("owned_by") != "arena" and model["id"] not in model_ids
+                        ]
+
+                    selected_model_id = None
+                    if isinstance(model_ids, list) and model_ids:
+                        selected_model_id = random.choice(model_ids)
+                    else:
+                        model_ids = [
+                            model["id"]
+                            for model in list(request.app.state.MODELS.values())
+                            if model.get("owned_by") != "arena"
+                        ]
+                        selected_model_id = random.choice(model_ids)
+
+                    form_data["model"] = selected_model_id
+                    generation.update(input={**generation_input, "selected_model_id": selected_model_id})
+
+                    if form_data.get("stream") == True:
+
+                        async def stream_wrapper(stream):
+                            yield f"data: {json.dumps({'selected_model_id': selected_model_id})}\n\n"
+                            async for chunk in stream:
+                                yield chunk
+
+                        response = await generate_chat_completion(
                             request, form_data, user, bypass_filter=True
                         )
-                    ),
-                    "selected_model_id": selected_model_id,
-                }
+                        return StreamingResponse(
+                            stream_wrapper(response.body_iterator),
+                            media_type="text/event-stream",
+                            background=response.background,
+                        )
+                    else:
+                        response = await generate_chat_completion(
+                            request, form_data, user, bypass_filter=True
+                        )
+                        return {
+                            **response,
+                            "selected_model_id": selected_model_id,
+                        }
 
-        if model.get("pipe"):
-            # Below does not require bypass_filter because this is the only route the uses this function and it is already bypassing the filter
-            return await generate_function_chat_completion(
-                request, form_data, user=user, models=models
-            )
-        if model.get("owned_by") == "ollama":
-            # Using /ollama/api/chat endpoint
-            form_data = convert_payload_openai_to_ollama(form_data)
-            response = await generate_ollama_chat_completion(
-                request=request,
-                form_data=form_data,
-                user=user,
-                bypass_filter=bypass_filter,
-            )
-            if form_data.get("stream"):
-                response.headers["content-type"] = "text/event-stream"
-                return StreamingResponse(
-                    convert_streaming_response_ollama_to_openai(response),
-                    headers=dict(response.headers),
-                    background=response.background,
+                if model.get("pipe"):
+                    # Below does not require bypass_filter because this is the only route the uses this function and it is already bypassing the filter
+                    response = await generate_function_chat_completion(
+                        request, form_data, user=user, models=models
+                    )
+                elif model.get("owned_by") == "ollama":
+                    # Using /ollama/api/chat endpoint
+                    form_data = convert_payload_openai_to_ollama(form_data)
+                    response = await generate_ollama_chat_completion(
+                        request=request,
+                        form_data=form_data,
+                        user=user,
+                        bypass_filter=bypass_filter,
+                    )
+                    if form_data.get("stream"):
+                        response.headers["content-type"] = "text/event-stream"
+                        return StreamingResponse(
+                            convert_streaming_response_ollama_to_openai(response),
+                            headers=dict(response.headers),
+                            background=response.background,
+                        )
+                    else:
+                        return convert_response_ollama_to_openai(response)
+                else:
+                    response = await generate_openai_chat_completion(
+                        request=request,
+                        form_data=form_data,
+                        user=user,
+                        bypass_filter=bypass_filter,
+                    )
+
+            # Update generation with successful response
+            if isinstance(response, dict):
+                generation.update(
+                    output=response,
+                    status="success"
                 )
-            else:
-                return convert_response_ollama_to_openai(response)
-        else:
-            return await generate_openai_chat_completion(
-                request=request,
-                form_data=form_data,
-                user=user,
-                bypass_filter=bypass_filter,
+            elif hasattr(response, 'body_iterator'):
+                # For streaming responses, we'll update with streaming info
+                generation.update(
+                    output={"streaming": True, "content_type": "text/event-stream"},
+                    status="success"
+                )
+            
+            return response
+
+        except Exception as e:
+            # Update generation with error
+            generation.update(
+                status="error",
+                error=str(e)
             )
+            raise e
 
 
 chat_completion = generate_chat_completion

@@ -2679,6 +2679,7 @@ dependencies = [
     { name = "itsdangerous" },
     { name = "langchain" },
     { name = "langchain-community" },
+    { name = "langfuse" },
     { name = "ldap3" },
     { name = "loguru" },
     { name = "markdown" },

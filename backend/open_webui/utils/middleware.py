@@ -120,6 +120,8 @@ from open_webui.env import (
 from open_webui.constants import TASKS
 from open_webui.utils.langfuse_utils import get_langfuse_client
 
+from open_webui.utils.langfuse_utils import get_langfuse_client, get_trace_url_from_span
+
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -288,13 +290,13 @@ async def chat_completion_tools_handler(
 ) -> tuple[dict, dict]:
     langfuse_client = get_langfuse_client()
     with langfuse_client.start_as_current_span(name="chat-completion-tools-handler") as span:
-        span.update(input={"model": body.get("model"), "tools_count": len(tools), "user_id": user.id})
-        
+        span.update(input={"tools": tools})
+            
         async def get_content_from_response(response) -> Optional[str]:
             content = None
             if hasattr(response, "body_iterator"):
                 async for chunk in response.body_iterator:
-                    data = json.loads(chunk.decode("utf-8"))
+                    data = json.loads(chunk.decode("utf-8", "replace"))
                     content = data["choices"][0]["message"]["content"]
 
                 # Cleanup any remaining background tasks if necessary
@@ -307,10 +309,33 @@ async def chat_completion_tools_handler(
         def get_tools_function_calling_payload(messages, task_model_id, content):
             user_message = get_last_user_message(messages)
 
-        recent_messages = messages[-4:] if len(messages) > 4 else messages
-        chat_history = "\n".join(
-            f"{message['role'].upper()}: \"\"\"{get_content_from_message(message)}\"\"\""
-            for message in recent_messages
+            recent_messages = messages[-4:] if len(messages) > 4 else messages
+            chat_history = "\n".join(
+                f"{message['role'].upper()}: \"\"\"{get_content_from_message(message)}\"\"\""
+                for message in recent_messages
+            )
+
+            prompt = f"History:\n{chat_history}\nQuery: {user_message}"
+
+            return {
+                "model": task_model_id,
+                "messages": [
+                    {"role": "system", "content": content},
+                    {"role": "user", "content": f"Query: {prompt}"},
+                ],
+                "stream": False,
+                "metadata": {"task": str(TASKS.FUNCTION_CALLING)},
+            }
+
+        event_caller = extra_params["__event_call__"]
+        event_emitter = extra_params["__event_emitter__"]
+        metadata = extra_params["__metadata__"]
+
+        task_model_id = get_task_model_id(
+            body["model"],
+            request.app.state.config.TASK_MODEL,
+            request.app.state.config.TASK_MODEL_EXTERNAL,
+            models,
         )
 
         skip_files = False
@@ -348,7 +373,10 @@ async def chat_completion_tools_handler(
 
                 result = json.loads(content)
 
+                span.update(input={"result": result})
+
                 async def tool_call_handler(tool_call):
+
                     nonlocal skip_files
 
                     log.debug(f"{tool_call=}")
@@ -359,8 +387,14 @@ async def chat_completion_tools_handler(
 
                     tool_function_params = tool_call.get("parameters", {})
 
+                    tool = None
+                    tool_type = ""
+                    direct_tool = False
+
                     try:
                         tool = tools[tool_function_name]
+                        tool_type = tool.get("type", "")
+                        direct_tool = tool.get("direct", False)
 
                         spec = tool.get("spec", {})
                         allowed_params = (
@@ -392,18 +426,46 @@ async def chat_completion_tools_handler(
                     except Exception as e:
                         tool_result = str(e)
 
-                    tool_result_files = []
-                    if isinstance(tool_result, list):
-                        for item in tool_result:
-                            # check if string
-                            if isinstance(item, str) and item.startswith("data:"):
-                                tool_result_files.append(item)
-                                tool_result.remove(item)
+                    tool_result, tool_result_files, tool_result_embeds = (
+                        process_tool_result(
+                            request,
+                            tool_function_name,
+                            tool_result,
+                            tool_type,
+                            direct_tool,
+                            metadata,
+                            user,
+                        )
+                    )
 
-                    if isinstance(tool_result, dict) or isinstance(tool_result, list):
-                        tool_result = json.dumps(tool_result, indent=2)
+                    if event_emitter:
+                        if tool_result_files:
+                            await event_emitter(
+                                {
+                                    "type": "files",
+                                    "data": {
+                                        "files": tool_result_files,
+                                    },
+                                }
+                            )
 
-                    if isinstance(tool_result, str):
+                        if tool_result_embeds:
+                            await event_emitter(
+                                {
+                                    "type": "embeds",
+                                    "data": {
+                                        "embeds": tool_result_embeds,
+                                    },
+                                }
+                            )
+
+                    print(
+                        f"Tool {tool_function_name} result: {tool_result}",
+                        tool_result_files,
+                        tool_result_embeds,
+                    )
+
+                    if tool_result:
                         tool = tools[tool_function_name]
                         tool_id = tool.get("tool_id", "")
 
@@ -417,12 +479,12 @@ async def chat_completion_tools_handler(
                         sources.append(
                             {
                                 "source": {
-                                    "name": (f"TOOL:{tool_name}"),
+                                    "name": (f"{tool_name}"),
                                 },
-                                "document": [tool_result],
+                                "document": [str(tool_result)],
                                 "metadata": [
                                     {
-                                        "source": (f"TOOL:{tool_name}"),
+                                        "source": (f"{tool_name}"),
                                         "parameters": tool_function_params,
                                     }
                                 ],
@@ -461,7 +523,7 @@ async def chat_completion_tools_handler(
         if skip_files and "files" in body.get("metadata", {}):
             del body["metadata"]["files"]
 
-        span.update(output={"success": True, "sources_count": len(sources), "skip_files": skip_files})
+        span.update(output={"sources": sources})
         return body, {"sources": sources}
 
 
@@ -471,7 +533,6 @@ async def chat_memory_handler(
     langfuse_client = get_langfuse_client()
     with langfuse_client.start_as_current_span(name="chat-memory-handler") as span:
         span.update(input={"user_id": user.id, "messages_count": len(form_data.get("messages", []))})
-        
         try:
             results = await query_memory(
                 request,
@@ -504,8 +565,10 @@ async def chat_memory_handler(
         form_data["messages"] = add_or_update_system_message(
             f"User Context:\n{user_context}\n", form_data["messages"], append=True
         )
-
-        span.update(output={"success": True, "context_length": len(user_context), "documents_found": len(results.documents[0]) if results and hasattr(results, "documents") and results.documents else 0})
+        span.update(output={
+            "success": True,
+            "form_data": form_data
+        })
         return form_data
 
 
@@ -514,6 +577,8 @@ async def chat_web_search_handler(
 ):
     langfuse_client = get_langfuse_client()
     with langfuse_client.start_as_current_span(name="chat-web-search-handler") as span:
+        span.update(input={"model": form_data["model"], "messages_count": len(form_data.get("messages", []))})
+            
         event_emitter = extra_params["__event_emitter__"]
         await event_emitter(
             {
@@ -580,7 +645,6 @@ async def chat_web_search_handler(
                     },
                 }
             )
-            span.update(output={"success": False, "reason": "no_queries_generated"})
             return form_data
 
         await event_emitter(
@@ -672,7 +736,7 @@ async def chat_web_search_handler(
                 }
             )
 
-        span.update(output={"success": True, "queries_count": len(queries), "files_added": len(form_data.get("files", []))})
+        span.update(output={"form_data": form_data})
         return form_data
 
 
@@ -681,8 +745,8 @@ async def chat_image_generation_handler(
 ):
     langfuse_client = get_langfuse_client()
     with langfuse_client.start_as_current_span(name="chat-image-generation-handler") as span:
-        span.update(input={"user_id": user.id, "messages_count": len(form_data.get("messages", []))})
-        
+        span.update(input={"model": form_data["model"], "messages_count": len(form_data.get("messages", []))})
+            
         __event_emitter__ = extra_params["__event_emitter__"]
         await __event_emitter__(
             {
@@ -728,7 +792,6 @@ async def chat_image_generation_handler(
                 prompt = user_message
 
         system_message_content = ""
-        images_generated = 0
 
         try:
             images = await image_generations(
@@ -736,7 +799,8 @@ async def chat_image_generation_handler(
                 form_data=GenerateImageForm(**{"prompt": prompt}),
                 user=user,
             )
-            images_generated = len(images)
+
+            span.update(output={"images": images})
 
             await __event_emitter__(
                 {
@@ -780,7 +844,6 @@ async def chat_image_generation_handler(
                 system_message_content, form_data["messages"]
             )
 
-        span.update(output={"success": images_generated > 0, "images_generated": images_generated, "prompt_length": len(prompt)})
         return form_data
 
 
@@ -789,16 +852,20 @@ async def chat_completion_files_handler(
 ) -> tuple[dict, dict[str, list]]:
     langfuse_client = get_langfuse_client()
     with langfuse_client.start_as_current_span(name="chat-completion-files-handler") as span:
+        span.update(input={"model": body["model"], "files_count": len(body.get("metadata", {}).get("files", []))})
+            
         __event_emitter__ = extra_params["__event_emitter__"]
         sources = []
-        queries = []
 
         if files := body.get("metadata", {}).get("files", None):
-            span.update(input={"files": files})
-            
             # Check if all files are in full context mode
-            all_full_context = all(item.get("context") == "full" for item in files)
+            all_full_context = all(
+                item.get("context") == "full"
+                for item in files
+                if item.get("type") == "file"
+            )
 
+            queries = []
             if not all_full_context:
                 try:
                     queries_response = await generate_queries(
@@ -828,10 +895,6 @@ async def chat_completion_files_handler(
                 except:
                     pass
 
-            if len(queries) == 0:
-                queries = [get_last_user_message(body["messages"])]
-
-            if not all_full_context:
                 await __event_emitter__(
                     {
                         "type": "status",
@@ -842,6 +905,9 @@ async def chat_completion_files_handler(
                         },
                     }
                 )
+
+            if len(queries) == 0:
+                queries = [get_last_user_message(body["messages"])]
 
             try:
                 # Offload get_sources_from_items to a separate thread
@@ -881,7 +947,6 @@ async def chat_completion_files_handler(
             log.debug(f"rag_contexts:sources: {sources}")
 
             unique_ids = set()
-
             for source in sources or []:
                 if not source or len(source.keys()) == 0:
                     continue
@@ -900,7 +965,6 @@ async def chat_completion_files_handler(
                     unique_ids.add(_id)
 
             sources_count = len(unique_ids)
-
             await __event_emitter__(
                 {
                     "type": "status",
@@ -912,11 +976,7 @@ async def chat_completion_files_handler(
                 }
             )
 
-        span.update(output={
-            "success": True,
-            "sources": sources,
-            "queries": queries,
-        })
+        span.update(output={"sources": sources})
         return body, {"sources": sources}
 
 
@@ -978,15 +1038,19 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     with langfuse_client.start_as_current_span(name="process-chat-payload") as span:
         span.update(input={**form_data})
 
+    langfuse_client = get_langfuse_client()
+    with langfuse_client.start_as_current_span(name="process-chat-payload") as span:
+        span.update(input={"model": model["id"], "messages_count": len(form_data.get("messages", []))})
+
         form_data = apply_params_to_form_data(form_data, model)
         log.debug(f"form_data: {form_data}")
 
         system_message = get_system_message(form_data.get("messages", []))
-        if system_message:
+        if system_message:  # Chat Controls/User Settings
             try:
                 form_data = apply_system_prompt_to_body(
-                    system_message.get("content"), form_data, metadata, user
-                )
+                    system_message.get("content"), form_data, metadata, user, replace=True
+                )  # Required to handle system prompt variables
             except:
                 pass
 
@@ -1127,10 +1191,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 form_data = await chat_memory_handler(
                     request, form_data, extra_params, user
                 )
-        
-            experimental_mode_enabled = form_data.get("experimentalModeEnabled", False)
-            if experimental_mode_enabled:
-                print("Experimental mode enabled")
 
             if "web_search" in features and features["web_search"]:
                 form_data = await chat_web_search_handler(
@@ -1155,8 +1215,28 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         tool_ids = form_data.pop("tool_ids", None)
         files = form_data.pop("files", None)
 
-        # Remove files duplicates
+        prompt = get_last_user_message(form_data["messages"])
+        # TODO: re-enable URL extraction from prompt
+        # urls = []
+        # if prompt and len(prompt or "") < 500 and (not files or len(files) == 0):
+        #     urls = extract_urls(prompt)
+
         if files:
+            if not files:
+                files = []
+
+            for file_item in files:
+                if file_item.get("type", "file") == "folder":
+                    # Get folder files
+                    folder_id = file_item.get("id", None)
+                    if folder_id:
+                        folder = Folders.get_folder_by_id_and_user_id(folder_id, user.id)
+                        if folder and folder.data and "files" in folder.data:
+                            files = [f for f in files if f.get("id", None) != folder_id]
+                            files = [*files, *folder.data["files"]]
+
+            # files = [*files, *[{"type": "url", "url": url, "name": url} for url in urls]]
+            # Remove duplicate files based on their content
             files = list({json.dumps(f, sort_keys=True): f for f in files}.values())
 
         metadata = {
@@ -1176,7 +1256,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
         tools_dict = {}
 
-        mcp_clients = []
+        mcp_clients = {}
         mcp_tools_dict = {}
 
         if tool_ids:
@@ -1237,35 +1317,38 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                                 log.error(f"Error getting OAuth token: {e}")
                                 oauth_token = None
 
-                        mcp_client = MCPClient()
-                        await mcp_client.connect(
+                        mcp_clients[server_id] = MCPClient()
+                        await mcp_clients[server_id].connect(
                             url=mcp_server_connection.get("url", ""),
                             headers=headers if headers else None,
                         )
 
-                        tool_specs = await mcp_client.list_tool_specs()
+                        tool_specs = await mcp_clients[server_id].list_tool_specs()
                         for tool_spec in tool_specs:
 
-                            def make_tool_function(function_name):
+                            def make_tool_function(client, function_name):
                                 async def tool_function(**kwargs):
-                                    return await mcp_client.call_tool(
+                                    return await client.call_tool(
                                         function_name,
                                         function_args=kwargs,
                                     )
 
                                 return tool_function
 
-                            tool_function = make_tool_function(tool_spec["name"])
+                            tool_function = make_tool_function(
+                                mcp_clients[server_id], tool_spec["name"]
+                            )
 
-                            mcp_tools_dict[tool_spec["name"]] = {
-                                "spec": tool_spec,
+                            mcp_tools_dict[f"{server_id}_{tool_spec['name']}"] = {
+                                "spec": {
+                                    **tool_spec,
+                                    "name": f"{server_id}_{tool_spec['name']}",
+                                },
                                 "callable": tool_function,
                                 "type": "mcp",
-                                "client": mcp_client,
+                                "client": mcp_clients[server_id],
                                 "direct": False,
                             }
-
-                        mcp_clients.append(mcp_client)
                     except Exception as e:
                         log.debug(e)
                         continue
@@ -1306,7 +1389,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     {"type": "function", "function": tool.get("spec", {})}
                     for tool in tools_dict.values()
                 ]
-
             else:
                 # If the function calling is not native, then call the tools function calling handler
                 try:
@@ -1331,9 +1413,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             citation_idx_map = {}
 
             for source in sources:
-                is_tool_result = source.get("tool_result", False)
-
-                if "document" in source and not is_tool_result:
+                if "document" in source:
                     for document_text, document_metadata in zip(
                         source["document"], source["metadata"]
                     ):
@@ -1354,8 +1434,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         )
 
             context_string = context_string.strip()
-
-            prompt = get_last_user_message(form_data["messages"])
             if prompt is None:
                 raise Exception("No user message found")
 
@@ -1393,8 +1471,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     },
                 }
             )
-
-        span.update(output={**form_data, "events": events})
 
         return form_data, metadata, events
 
@@ -2975,7 +3051,7 @@ async def process_chat_response(
                     "done": True,
                     "content": serialize_content_blocks(content_blocks),
                     "title": title,
-                    "trace_url": metadata.get("trace_url"),  # Include trace URL in response
+                    "trace_url": metadata.get("trace_url")
                 }
 
                 if not ENABLE_REALTIME_CHAT_SAVE:

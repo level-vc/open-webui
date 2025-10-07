@@ -922,62 +922,96 @@ async def generate_chat_completion(
     else:
         request_url = f"{url}/chat/completions"
 
-    payload = json.dumps(payload)
+    # Initialize Langfuse client and start generation tracking
+    from open_webui.utils.langfuse_utils import get_langfuse_client
+    langfuse_client = get_langfuse_client()
+    
+    # Prepare generation input data
+    generation_input = {
+        "model": model_id,
+        "messages": payload.get("messages", []),
+        "temperature": payload.get("temperature"),
+        "max_tokens": payload.get("max_tokens"),
+        "stream": payload.get("stream", False),
+        "url": url
+    }
+    
+    with langfuse_client.start_as_current_generation(
+        name=f"openai_chat_completion_{model_id}",
+        input=generation_input,
+        model=model_id
+    ) as generation:
+        payload_json = json.dumps(payload)
 
-    r = None
-    session = None
-    streaming = False
-    response = None
+        r = None
+        session = None
+        streaming = False
+        response = None
 
-    try:
-        session = aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        )
-
-        r = await session.request(
-            method="POST",
-            url=request_url,
-            data=payload,
-            headers=headers,
-            cookies=cookies,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-        )
-
-        # Check if response is SSE
-        if "text/event-stream" in r.headers.get("Content-Type", ""):
-            streaming = True
-            return StreamingResponse(
-                r.content,
-                status_code=r.status,
-                headers=dict(r.headers),
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=session
-                ),
+        try:
+            session = aiohttp.ClientSession(
+                trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
             )
-        else:
-            try:
-                response = await r.json()
-            except Exception as e:
-                log.error(e)
-                response = await r.text()
 
-            if r.status >= 400:
-                if isinstance(response, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response)
+            r = await session.request(
+                method="POST",
+                url=request_url,
+                data=payload_json,
+                headers=headers,
+                cookies=cookies,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            )
+
+            # Check if response is SSE
+            if "text/event-stream" in r.headers.get("Content-Type", ""):
+                streaming = True
+                generation.update(
+                    output={"streaming": True, "content_type": "text/event-stream"},
+                    status="success"
+                )
+                return StreamingResponse(
+                    r.content,
+                    status_code=r.status,
+                    headers=dict(r.headers),
+                    background=BackgroundTask(
+                        cleanup_response, response=r, session=session
+                    ),
+                )
+            else:
+                try:
+                    response = await r.json()
+                except Exception as e:
+                    log.error(e)
+                    response = await r.text()
+
+                if r.status >= 400:
+                    generation.update(
+                        status="error",
+                        error=f"HTTP {r.status}: {response}"
+                    )
+                    if isinstance(response, (dict, list)):
+                        return JSONResponse(status_code=r.status, content=response)
+                    else:
+                        return PlainTextResponse(status_code=r.status, content=response)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response)
-
-            return response
-    except Exception as e:
-        log.exception(e)
-
-        raise HTTPException(
-            status_code=r.status if r else 500,
-            detail="Open WebUI: Server Connection Error",
-        )
-    finally:
-        if not streaming:
-            await cleanup_response(r, session)
+                    generation.update(
+                        output=response,
+                        status="success"
+                    )
+                    return response
+        except Exception as e:
+            log.exception(e)
+            generation.update(
+                status="error",
+                error=str(e)
+            )
+            raise HTTPException(
+                status_code=r.status if r else 500,
+                detail="Open WebUI: Server Connection Error",
+            )
+        finally:
+            if not streaming:
+                await cleanup_response(r, session)
 
 
 async def embeddings(request: Request, form_data: dict, user):
