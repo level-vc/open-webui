@@ -50,6 +50,7 @@ from open_webui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_system_prompt_to_body,
 )
+from open_webui.utils.langfuse import get_langfuse_client
 
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
@@ -160,7 +161,6 @@ async def generate_function_chat_completion(
     request, form_data, user, models: dict = {}
 ):
     # Initialize Langfuse client and start generation tracking
-    from open_webui.utils.langfuse_utils import get_langfuse_client
     langfuse_client = get_langfuse_client()
     
     model_id = form_data.get("model")

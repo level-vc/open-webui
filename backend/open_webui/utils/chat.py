@@ -12,7 +12,7 @@ import asyncio
 
 from fastapi import Request, status
 from starlette.responses import Response, StreamingResponse, JSONResponse
-from open_webui.utils.langfuse_utils import get_langfuse_client
+from open_webui.utils.langfuse import get_langfuse_client
 
 
 from open_webui.models.users import UserModel

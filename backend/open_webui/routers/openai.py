@@ -49,7 +49,7 @@ from open_webui.utils.misc import (
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_access
-
+from open_webui.utils.langfuse import get_langfuse_client
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["OPENAI"])
@@ -922,8 +922,6 @@ async def generate_chat_completion(
     else:
         request_url = f"{url}/chat/completions"
 
-    # Initialize Langfuse client and start generation tracking
-    from open_webui.utils.langfuse_utils import get_langfuse_client
     langfuse_client = get_langfuse_client()
     
     # Prepare generation input data

@@ -510,7 +510,7 @@ log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 # External telemetry
 import sentry_sdk
-from open_webui.utils.langfuse_utils import get_langfuse_client
+from open_webui.utils.langfuse import get_langfuse_client, get_trace_url_from_span
 
 def traces_sampler(sampling_context):
     """
@@ -1504,6 +1504,7 @@ async def chat_completion(
             "files": form_data.get("files", None),
             "features": form_data.get("features", {}),
             "variables": form_data.get("variables", {}),
+            "experimentalModeEnabled": form_data.pop("experimentalModeEnabled", False),
             "model": model,
             "direct": model_item.get("direct", False),
             "params": {
@@ -1547,7 +1548,6 @@ async def chat_completion(
                 span.update(input={ **model })
                 
                 # Get trace URL for the response metadata
-                from open_webui.utils.langfuse_utils import get_trace_url_from_span
                 trace_url = get_trace_url_from_span(span)
                 
                 # Add trace URL to metadata

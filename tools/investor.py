@@ -2,16 +2,15 @@
 title: Level Investor
 author: Level VC
 author_url: https://levelvc.com
-version: 1.0.0
+version: 1.1.0
 description: Allows the agent to retrieve information about companies (public and private market), our portfolio, relevant people, and other topics of investments
+
+Configuration:
+- Configure the API key through the Open WebUI tool configuration interface
 """
 
-from typing import Any, Dict, Optional
-
 import requests
-
-API_BASE_URL = "https://api.lvcdev.com"
-API_KEY = "lvc-iss-LF8yX8XAg2d2Qra1r5jLsO0cLtwY0IQf"
+from pydantic import BaseModel, Field
 
 
 async def _emit_event(
@@ -27,12 +26,11 @@ async def _emit_event(
                 }
             )
         except Exception:
-            # Silently ignore event emission errors to not break the tool
             pass
 
 
 async def _emit_citation(
-    event_emitter, content: list, title: str, url: str
+    event_emitter, content: str, title: str, url: str
 ):
     """Helper function to emit citations."""
     if event_emitter:
@@ -40,7 +38,7 @@ async def _emit_citation(
             await event_emitter({
                 "type": "citation",
                 "data": {
-                    "document": content,
+                    "document": [content],
                     "source": {"name": title, "url": url}
                 }
             })
@@ -50,12 +48,12 @@ async def _emit_citation(
 
 
 def _make_api_request(
-    method: str, endpoint: str, data: Optional[Dict] = None
-) -> Dict[str, Any]:
+    method: str, endpoint: str, data: dict = None, valves=None
+) -> dict:
     """Make authenticated API request to LVC API."""
-    url = f"{API_BASE_URL}{endpoint}"
+    url = f"https://api.lvcdev.com{endpoint}"
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {valves.api_key}",
         "Content-Type": "application/json",
     }
 
@@ -75,18 +73,23 @@ def _make_api_request(
 
 class Tools:
     def __init__(self):
+        """Initialize the Tool."""
+        self.valves = self.Valves()
         self.citation = False
+
+    class Valves(BaseModel):
+        api_key: str = Field("", description="Your Level VC API key")
 
     async def semantic_search_transcripts(
         self,
         query: str,
         search_type: str = "balanced",
         limit: str = "30",
-        symbol: Optional[str] = None,
-        year: Optional[str] = None,
-        quarter: Optional[str] = None,
-        min_year: Optional[str] = None,
-        max_year: Optional[str] = None,
+        symbol: str = None,
+        year: str = None,
+        quarter: str = None,
+        min_year: str = None,
+        max_year: str = None,
         extract_quotes: bool = True,
         __event_emitter__=None,
     ) -> str:
@@ -138,7 +141,7 @@ class Tools:
         }
 
         result = _make_api_request(
-            "POST", "/investor/semantic-search-transcripts", data
+            "POST", "/investor/semantic-search-transcripts", data, self.valves
         )
 
         # Emit completion event
@@ -166,7 +169,7 @@ class Tools:
                         
                         await _emit_citation(
                             __event_emitter__,
-                            content=[quotes],
+                            content=quotes,
                             title=citation,
                             url="https://levelvc.com"
                         )
@@ -177,11 +180,11 @@ class Tools:
         self,
         keywords: str,
         limit: str = "25",
-        symbol: Optional[str] = None,
-        year: Optional[str] = None,
-        quarter: Optional[str] = None,
-        min_year: Optional[str] = None,
-        max_year: Optional[str] = None,
+        symbol: str = None,
+        year: str = None,
+        quarter: str = None,
+        min_year: str = None,
+        max_year: str = None,
         match_type: str = "any",
         extract_quotes: bool = True,
         __event_emitter__=None,
@@ -233,7 +236,7 @@ class Tools:
             "extract_quotes": extract_quotes,
         }
 
-        result = _make_api_request("POST", "/investor/keyword-search-transcripts", data)
+        result = _make_api_request("POST", "/investor/keyword-search-transcripts", data, self.valves)
 
         # Emit completion event
         if isinstance(result, dict) and "error" in result:
@@ -260,7 +263,7 @@ class Tools:
                         
                         await _emit_citation(
                             __event_emitter__,
-                            content=[quotes],
+                            content=quotes,
                             title=citation,
                             url="https://levelvc.com"
                         )
@@ -294,7 +297,7 @@ class Tools:
 
         data = {"symbol": symbol.upper(), "year": year, "quarter": quarter.upper()}
 
-        result = _make_api_request("POST", "/investor/transcript-details", data)
+        result = _make_api_request("POST", "/investor/transcript-details", data, self.valves)
 
         # Emit completion event
         if isinstance(result, dict) and "error" in result:
@@ -318,7 +321,7 @@ class Tools:
                 
                 await _emit_citation(
                     __event_emitter__,
-                    content=[quotes],
+                    content=quotes,
                     title=citation,
                     url="https://levelvc.com"
                 )
@@ -330,7 +333,7 @@ class Tools:
         query: str,
         search_type: str = "balanced",
         limit: str = "25",
-        entity_type: Optional[str] = None,
+        entity_type: str = None,
         extract_quotes: bool = True,
         __event_emitter__=None,
     ) -> str:
@@ -372,7 +375,7 @@ class Tools:
             "extract_quotes": extract_quotes,
         }
 
-        result = _make_api_request("POST", "/investor/semantic-search-knowledge", data)
+        result = _make_api_request("POST", "/investor/semantic-search-knowledge", data, self.valves)
 
         # Emit completion event
         if isinstance(result, dict) and "error" in result:
@@ -402,7 +405,7 @@ class Tools:
                         
                         await _emit_citation(
                             __event_emitter__,
-                            content=[quotes],
+                            content=quotes,
                             title=f"Knowledge Page {title}",
                             url=url
                         )
@@ -414,14 +417,14 @@ class Tools:
         query: str,
         search_type: str = "balanced",
         limit: str = "100",
-        country_code: Optional[str] = None,
-        funding_stage: Optional[str] = None,
-        level_portfolio: Optional[str] = None,
-        min_funding_usd: Optional[str] = None,
-        max_funding_usd: Optional[str] = None,
+        country_code: str = None,
+        funding_stage: str = None,
+        level_portfolio: str = None,
+        min_funding_usd: str = None,
+        max_funding_usd: str = None,
         min_market_cap: str | None = None,
         max_market_cap: str | None = None,
-        status: Optional[str] = "Active",
+        status: str = "Active",
         use_reference_org: bool = False,
         reference_search_method: str = "name",
         use_llm_filtering: bool = True,
@@ -585,7 +588,7 @@ class Tools:
             "use_llm_filtering": use_llm_filtering,
         }
 
-        result = _make_api_request("POST", "/investor/similar-organizations", data)
+        result = _make_api_request("POST", "/investor/similar-organizations", data, self.valves)
 
         # Emit completion event
         if isinstance(result, dict) and "error" in result:
@@ -635,7 +638,7 @@ class Tools:
 
         data = {"identifier": identifier, "search_by": search_by}
 
-        result = _make_api_request("POST", "/investor/organization-details", data)
+        result = _make_api_request("POST", "/investor/organization-details", data, self.valves)
 
         # Emit completion event
         if isinstance(result, dict) and "error" in result:
@@ -665,8 +668,8 @@ class Tools:
         query: str,
         search_type: str = "balanced",
         limit: str = "25",
-        author: Optional[str] = None,
-        tags: Optional[str] = None,
+        author: str = None,
+        tags: str = None,
         extract_quotes: bool = True,
         __event_emitter__=None,
     ) -> str:
@@ -712,7 +715,7 @@ class Tools:
             "extract_quotes": extract_quotes,
         }
 
-        result = _make_api_request("POST", "/investor/search-documents", data)
+        result = _make_api_request("POST", "/investor/search-documents", data, self.valves)
 
         # Emit completion event
         if isinstance(result, dict) and "error" in result:
@@ -736,8 +739,8 @@ class Tools:
     async def list_recent_documents(
         self,
         limit: str = "50",
-        author: Optional[str] = None,
-        tags: Optional[str] = None,
+        author: str = None,
+        tags: str = None,
         __event_emitter__=None,
     ) -> str:
         """
@@ -771,7 +774,7 @@ class Tools:
 
         data = {"limit": limit, "author": author, "tags": tags}
 
-        result = _make_api_request("POST", "/investor/recent-documents", data)
+        result = _make_api_request("POST", "/investor/recent-documents", data, self.valves)
 
         # Emit completion event
         if isinstance(result, dict) and "error" in result:
@@ -796,7 +799,7 @@ class Tools:
         self,
         keywords: str,
         limit: str = "25",
-        entity_type: Optional[str] = None,
+        entity_type: str = None,
         match_type: str = "any",
         extract_quotes: bool = True,
         __event_emitter__=None,
@@ -840,7 +843,7 @@ class Tools:
             "extract_quotes": extract_quotes,
         }
 
-        result = _make_api_request("POST", "/investor/keyword-search-knowledge", data)
+        result = _make_api_request("POST", "/investor/keyword-search-knowledge", data, self.valves)
 
         # Emit completion event
         if isinstance(result, dict) and "error" in result:
@@ -869,7 +872,7 @@ class Tools:
                         
                         await _emit_citation(
                             __event_emitter__,
-                            content=[quotes],
+                            content=quotes,
                             title=f"Knowledge Page {title}",
                             url=url
                         )
@@ -899,7 +902,7 @@ class Tools:
 
         data = {"uuid": uuid}
 
-        result = _make_api_request("POST", "/investor/fetch-knowledge-page", data)
+        result = _make_api_request("POST", "/investor/fetch-knowledge-page", data, self.valves)
 
         # Emit completion event
         if isinstance(result, dict) and "error" in result:
@@ -926,7 +929,7 @@ class Tools:
                 
                 await _emit_citation(
                     __event_emitter__,
-                    content=[quotes],
+                    content=quotes,
                     title=f"Knowledge Page {title}",
                     url=url
                 )
@@ -956,7 +959,7 @@ class Tools:
 
         data = {"uuid": uuid}
 
-        result = _make_api_request("POST", "/investor/document-details", data)
+        result = _make_api_request("POST", "/investor/document-details", data, self.valves)
 
         # Emit completion event
         if isinstance(result, dict) and "error" in result:

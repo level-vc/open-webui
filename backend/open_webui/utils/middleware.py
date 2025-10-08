@@ -118,9 +118,7 @@ from open_webui.env import (
     ENABLE_QUERIES_CACHE,
 )
 from open_webui.constants import TASKS
-from open_webui.utils.langfuse_utils import get_langfuse_client
-
-from open_webui.utils.langfuse_utils import get_langfuse_client, get_trace_url_from_span
+from open_webui.utils.langfuse import get_langfuse_client
 
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
@@ -391,6 +389,17 @@ async def chat_completion_tools_handler(
                     tool_type = ""
                     direct_tool = False
 
+                    # Collect citation events from this tool call
+                    tool_citations = []
+
+                    # Create a custom event emitter that captures citation events
+                    async def citation_collecting_emitter(event_data):
+                        if event_data.get("type") == "citation":
+                            tool_citations.append(event_data.get("data", {}))
+                        # Also emit the event normally
+                        if event_emitter:
+                            await event_emitter(event_data)
+
                     try:
                         tool = tools[tool_function_name]
                         tool_type = tool.get("type", "")
@@ -421,7 +430,11 @@ async def chat_completion_tools_handler(
                             )
                         else:
                             tool_function = tool["callable"]
-                            tool_result = await tool_function(**tool_function_params)
+                            # Pass the citation-collecting emitter to the tool
+                            tool_result = await tool_function(
+                                **tool_function_params, 
+                                __event_emitter__=citation_collecting_emitter
+                            )
 
                     except Exception as e:
                         tool_result = str(e)
@@ -475,22 +488,46 @@ async def chat_completion_tools_handler(
                             else f"{tool_function_name}"
                         )
 
-                        # Citation is enabled for this tool
-                        sources.append(
-                            {
-                                "source": {
-                                    "name": (f"{tool_name}"),
-                                },
-                                "document": [str(tool_result)],
-                                "metadata": [
+                        # If we have collected citations from the tool, create separate sources for each
+                        if tool_citations:
+                            for citation in tool_citations:
+                                citation_source = citation.get("source", {})
+                                citation_document = citation.get("document", [])
+                                
+                                sources.append(
                                     {
-                                        "source": (f"{tool_name}"),
-                                        "parameters": tool_function_params,
+                                        "source": {
+                                            "name": citation_source.get("name", tool_name),
+                                            "url": citation_source.get("url", ""),
+                                        },
+                                        "document": citation_document,
+                                        "metadata": [
+                                            {
+                                                "source": citation_source.get("name", tool_name),
+                                                "parameters": tool_function_params,
+                                            }
+                                        ],
+                                        "tool_result": True,
                                     }
-                                ],
-                                "tool_result": True,
-                            }
-                        )
+                                )
+                        else:
+                            # Fallback to original behavior if no citations were collected
+                            sources.append(
+                                {
+                                    "source": {
+                                        "name": (f"{tool_name}"),
+                                    },
+                                    "document": [str(tool_result)],
+                                    "metadata": [
+                                        {
+                                            "source": (f"{tool_name}"),
+                                            "parameters": tool_function_params,
+                                        }
+                                    ],
+                                    "tool_result": True,
+                                }
+                            )
+                        
                         # Citation is not enabled for this tool
                         body["messages"] = add_or_update_user_message(
                             f"\nTool `{tool_name}` Output: {tool_result}",
@@ -851,9 +888,7 @@ async def chat_completion_files_handler(
     request: Request, body: dict, extra_params: dict, user: UserModel
 ) -> tuple[dict, dict[str, list]]:
     langfuse_client = get_langfuse_client()
-    with langfuse_client.start_as_current_span(name="chat-completion-files-handler") as span:
-        span.update(input={"model": body["model"], "files_count": len(body.get("metadata", {}).get("files", []))})
-            
+    with langfuse_client.start_as_current_span(name="chat-completion-files-handler") as span:            
         __event_emitter__ = extra_params["__event_emitter__"]
         sources = []
 
@@ -864,6 +899,7 @@ async def chat_completion_files_handler(
                 for item in files
                 if item.get("type") == "file"
             )
+            span.update(input={"files": files})
 
             queries = []
             if not all_full_context:
@@ -1036,11 +1072,9 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # -> Chat Files
     langfuse_client = get_langfuse_client()
     with langfuse_client.start_as_current_span(name="process-chat-payload") as span:
-        span.update(input={**form_data})
-
-    langfuse_client = get_langfuse_client()
-    with langfuse_client.start_as_current_span(name="process-chat-payload") as span:
         span.update(input={"model": model["id"], "messages_count": len(form_data.get("messages", []))})
+
+        experimental_mode_enabled = metadata.get("experimentalModeEnabled", False)
 
         form_data = apply_params_to_form_data(form_data, model)
         log.debug(f"form_data: {form_data}")
@@ -1184,220 +1218,326 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             )
         except Exception as e:
             raise Exception(f"{e}")
+        
+        async def process_features(form_data, sources):
+            features = form_data.pop("features", None)
+            if features:
+                if "memory" in features and features["memory"]:
+                    form_data = await chat_memory_handler(
+                        request, form_data, extra_params, user
+                    )
 
-        features = form_data.pop("features", None)
-        if features:
-            if "memory" in features and features["memory"]:
-                form_data = await chat_memory_handler(
-                    request, form_data, extra_params, user
-                )
+                if "web_search" in features and features["web_search"]:
+                    if experimental_mode_enabled and len(sources) > 0:
+                        user_message = get_last_user_message(form_data["messages"])
+                        
+                        # Extract full context from all sources
+                        full_context_parts = []
+                        source_count = 0
+                        total_context_length = 0
+                        max_context_length = 4000  # Limit to prevent overly long prompts
+                        max_individual_source_length = 1000  # Max length per source
+                        
+                        for source in sources:
+                            if "document" in source and source["document"]:
+                                source_info = source.get("source", {})
+                                source_name = source_info.get("name", "Unknown source")
+                                
+                                # Combine all document texts from this source
+                                documents = source["document"]
+                                if isinstance(documents, list):
+                                    # Join documents with clear separation
+                                    doc_parts = []
+                                    for doc in documents:
+                                        if doc and str(doc).strip():
+                                            doc_parts.append(str(doc).strip())
+                                    source_content = "\n---\n".join(doc_parts)
+                                else:
+                                    source_content = str(documents).strip() if documents else ""
+                                
+                                if source_content:
+                                    # Smart truncation - try to keep complete sentences/paragraphs
+                                    if len(source_content) > max_individual_source_length:
+                                        truncated = source_content[:max_individual_source_length]
+                                        # Try to end at a sentence boundary
+                                        last_period = truncated.rfind('.')
+                                        last_newline = truncated.rfind('\n')
+                                        cut_point = max(last_period, last_newline)
+                                        
+                                        if cut_point > max_individual_source_length * 0.7:  # If we can keep at least 70%
+                                            source_content = truncated[:cut_point + 1] + "\n[Content truncated...]"
+                                        else:
+                                            source_content = truncated + "..."
+                                    
+                                    source_entry = f"Source: {source_name}\nContent: {source_content}"
+                                    
+                                    # Check if adding this source would exceed our limit
+                                    if total_context_length + len(source_entry) > max_context_length:
+                                        break
+                                    
+                                    full_context_parts.append(source_entry)
+                                    total_context_length += len(source_entry)
+                                    source_count += 1
+                        
+                        if full_context_parts:
+                            available_context = "\n\n".join(full_context_parts)
+                            
+                            # Create a comprehensive context section
+                            context_header = f"=== EXISTING CONTEXT FROM {source_count} SOURCE(S) ==="
+                            if source_count < len(sources):
+                                context_header += f" ({len(sources) - source_count} additional sources truncated)"
+                            
+                            enhanced_message = f"""{user_message}
 
-            if "web_search" in features and features["web_search"]:
-                form_data = await chat_web_search_handler(
-                    request, form_data, extra_params, user
-                )
+{context_header}
 
-            if "image_generation" in features and features["image_generation"]:
-                form_data = await chat_image_generation_handler(
-                    request, form_data, extra_params, user
-                )
+{available_context}
 
-            if "code_interpreter" in features and features["code_interpreter"]:
-                form_data["messages"] = add_or_update_user_message(
-                    (
-                        request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE
-                        if request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE != ""
-                        else DEFAULT_CODE_INTERPRETER_PROMPT
-                    ),
-                    form_data["messages"],
-                )
+=== END EXISTING CONTEXT ===
 
-        tool_ids = form_data.pop("tool_ids", None)
-        files = form_data.pop("files", None)
+Based on the existing context above, evaluate whether additional web search is needed to provide a complete and accurate answer to the user's question. If the existing context is sufficient, you may skip or minimize web searching."""
+                        else:
+                            # Fallback to source names if no document content available
+                            source_names = [source.get("source", {}).get("name", "Unknown source") for source in sources]
+                            context_summary = f"Available context from {len(sources)} sources: {', '.join(source_names[:3])}"
+                            if len(source_names) > 3:
+                                context_summary += f" and {len(source_names) - 3} more"
+                            enhanced_message = f"{user_message}\n\nNote: {context_summary}. Consider if additional web search is needed given this existing context."
+                        
+                        original_messages = form_data["messages"].copy()
+                        form_data["messages"] = add_or_update_user_message(
+                            enhanced_message,
+                            form_data["messages"],
+                            append=False,
+                        )
+                        
+                        if full_context_parts:
+                            log.info(f"🧪 Experimental mode: Enhanced web search prompt with full context from {source_count} sources ({total_context_length} chars)")
+                            log.debug(f"Enhanced message preview: {enhanced_message[:200]}...")
+                        else:
+                            log.debug(f"🧪 Experimental mode: Enhanced web search prompt with source names fallback")
+                        
+                        form_data = await chat_web_search_handler(
+                            request, form_data, extra_params, user
+                        )
+                        
+                        files_added = form_data.get("files", [])
+                        form_data["messages"] = original_messages
+                        if files_added:
+                            form_data["files"] = files_added
+                    else:
+                        form_data = await chat_web_search_handler(
+                            request, form_data, extra_params, user
+                        )
 
-        prompt = get_last_user_message(form_data["messages"])
-        # TODO: re-enable URL extraction from prompt
-        # urls = []
-        # if prompt and len(prompt or "") < 500 and (not files or len(files) == 0):
-        #     urls = extract_urls(prompt)
+                if "image_generation" in features and features["image_generation"]:
+                    form_data = await chat_image_generation_handler(
+                        request, form_data, extra_params, user
+                    )
 
-        if files:
-            if not files:
-                files = []
+                if "code_interpreter" in features and features["code_interpreter"]:
+                    form_data["messages"] = add_or_update_user_message(
+                        (
+                            request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE
+                            if request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE != ""
+                            else DEFAULT_CODE_INTERPRETER_PROMPT
+                        ),
+                        form_data["messages"],
+                    )
 
-            for file_item in files:
-                if file_item.get("type", "file") == "folder":
-                    # Get folder files
-                    folder_id = file_item.get("id", None)
-                    if folder_id:
-                        folder = Folders.get_folder_by_id_and_user_id(folder_id, user.id)
-                        if folder and folder.data and "files" in folder.data:
-                            files = [f for f in files if f.get("id", None) != folder_id]
-                            files = [*files, *folder.data["files"]]
+            return form_data
 
-            # files = [*files, *[{"type": "url", "url": url, "name": url} for url in urls]]
-            # Remove duplicate files based on their content
-            files = list({json.dumps(f, sort_keys=True): f for f in files}.values())
+        async def process_tools_and_functions(form_data, metadata, request, user, sources):
+            tool_ids = form_data.pop("tool_ids", None)
+            files = form_data.pop("files", None)
 
-        metadata = {
-            **metadata,
-            "tool_ids": tool_ids,
-            "files": files,
-        }
-        form_data["metadata"] = metadata
+            if files:
+                if not files:
+                    files = []
 
-        # Server side tools
-        tool_ids = metadata.get("tool_ids", None)
-        # Client side tools
-        direct_tool_servers = metadata.get("tool_servers", None)
+                for file_item in files:
+                    if file_item.get("type", "file") == "folder":
+                        # Get folder files
+                        folder_id = file_item.get("id", None)
+                        if folder_id:
+                            folder = Folders.get_folder_by_id_and_user_id(folder_id, user.id)
+                            if folder and folder.data and "files" in folder.data:
+                                files = [f for f in files if f.get("id", None) != folder_id]
+                                files = [*files, *folder.data["files"]]
 
-        log.debug(f"{tool_ids=}")
-        log.debug(f"{direct_tool_servers=}")
+                # files = [*files, *[{"type": "url", "url": url, "name": url} for url in urls]]
+                # Remove duplicate files based on their content
+                files = list({json.dumps(f, sort_keys=True): f for f in files}.values())
 
-        tools_dict = {}
+            metadata = {
+                **metadata,
+                "tool_ids": tool_ids,
+                "files": files,
+            }
+            form_data["metadata"] = metadata
 
-        mcp_clients = {}
-        mcp_tools_dict = {}
+            # Server side tools
+            tool_ids = metadata.get("tool_ids", None)
+            # Client side tools
+            direct_tool_servers = metadata.get("tool_servers", None)
 
-        if tool_ids:
-            for tool_id in tool_ids:
-                if tool_id.startswith("server:mcp:"):
-                    try:
-                        server_id = tool_id[len("server:mcp:") :]
+            log.debug(f"{tool_ids=}")
+            log.debug(f"{direct_tool_servers=}")
 
-                        mcp_server_connection = None
-                        for (
-                            server_connection
-                        ) in request.app.state.config.TOOL_SERVER_CONNECTIONS:
-                            if (
-                                server_connection.get("type", "") == "mcp"
-                                and server_connection.get("info", {}).get("id") == server_id
-                            ):
-                                mcp_server_connection = server_connection
-                                break
+            tools_dict = {}
 
-                        if not mcp_server_connection:
-                            log.error(f"MCP server with id {server_id} not found")
-                            continue
+            mcp_clients = {}
+            mcp_tools_dict = {}
 
-                        auth_type = mcp_server_connection.get("auth_type", "")
+            if tool_ids:
+                for tool_id in tool_ids:
+                    if tool_id.startswith("server:mcp:"):
+                        try:
+                            server_id = tool_id[len("server:mcp:") :]
 
-                        headers = {}
-                        if auth_type == "bearer":
-                            headers["Authorization"] = (
-                                f"Bearer {mcp_server_connection.get('key', '')}"
-                            )
-                        elif auth_type == "none":
-                            # No authentication
-                            pass
-                        elif auth_type == "session":
-                            headers["Authorization"] = (
-                                f"Bearer {request.state.token.credentials}"
-                            )
-                        elif auth_type == "system_oauth":
-                            oauth_token = extra_params.get("__oauth_token__", None)
-                            if oauth_token:
+                            mcp_server_connection = None
+                            for (
+                                server_connection
+                            ) in request.app.state.config.TOOL_SERVER_CONNECTIONS:
+                                if (
+                                    server_connection.get("type", "") == "mcp"
+                                    and server_connection.get("info", {}).get("id") == server_id
+                                ):
+                                    mcp_server_connection = server_connection
+                                    break
+
+                            if not mcp_server_connection:
+                                log.error(f"MCP server with id {server_id} not found")
+                                continue
+
+                            auth_type = mcp_server_connection.get("auth_type", "")
+
+                            headers = {}
+                            if auth_type == "bearer":
                                 headers["Authorization"] = (
-                                    f"Bearer {oauth_token.get('access_token', '')}"
+                                    f"Bearer {mcp_server_connection.get('key', '')}"
                                 )
-                        elif auth_type == "oauth_2.1":
-                            try:
-                                splits = server_id.split(":")
-                                server_id = splits[-1] if len(splits) > 1 else server_id
-
-                                oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
-                                    user.id, f"mcp:{server_id}"
+                            elif auth_type == "none":
+                                # No authentication
+                                pass
+                            elif auth_type == "session":
+                                headers["Authorization"] = (
+                                    f"Bearer {request.state.token.credentials}"
                                 )
-
+                            elif auth_type == "system_oauth":
+                                oauth_token = extra_params.get("__oauth_token__", None)
                                 if oauth_token:
                                     headers["Authorization"] = (
                                         f"Bearer {oauth_token.get('access_token', '')}"
                                     )
-                            except Exception as e:
-                                log.error(f"Error getting OAuth token: {e}")
-                                oauth_token = None
+                            elif auth_type == "oauth_2.1":
+                                try:
+                                    splits = server_id.split(":")
+                                    server_id = splits[-1] if len(splits) > 1 else server_id
 
-                        mcp_clients[server_id] = MCPClient()
-                        await mcp_clients[server_id].connect(
-                            url=mcp_server_connection.get("url", ""),
-                            headers=headers if headers else None,
-                        )
-
-                        tool_specs = await mcp_clients[server_id].list_tool_specs()
-                        for tool_spec in tool_specs:
-
-                            def make_tool_function(client, function_name):
-                                async def tool_function(**kwargs):
-                                    return await client.call_tool(
-                                        function_name,
-                                        function_args=kwargs,
+                                    oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
+                                        user.id, f"mcp:{server_id}"
                                     )
 
-                                return tool_function
+                                    if oauth_token:
+                                        headers["Authorization"] = (
+                                            f"Bearer {oauth_token.get('access_token', '')}"
+                                        )
+                                except Exception as e:
+                                    log.error(f"Error getting OAuth token: {e}")
+                                    oauth_token = None
 
-                            tool_function = make_tool_function(
-                                mcp_clients[server_id], tool_spec["name"]
+                            mcp_clients[server_id] = MCPClient()
+                            await mcp_clients[server_id].connect(
+                                url=mcp_server_connection.get("url", ""),
+                                headers=headers if headers else None,
                             )
 
-                            mcp_tools_dict[f"{server_id}_{tool_spec['name']}"] = {
-                                "spec": {
-                                    **tool_spec,
-                                    "name": f"{server_id}_{tool_spec['name']}",
-                                },
-                                "callable": tool_function,
-                                "type": "mcp",
-                                "client": mcp_clients[server_id],
-                                "direct": False,
-                            }
+                            tool_specs = await mcp_clients[server_id].list_tool_specs()
+                            for tool_spec in tool_specs:
+
+                                def make_tool_function(client, function_name):
+                                    async def tool_function(**kwargs):
+                                        return await client.call_tool(
+                                            function_name,
+                                            function_args=kwargs,
+                                        )
+
+                                    return tool_function
+
+                                tool_function = make_tool_function(
+                                    mcp_clients[server_id], tool_spec["name"]
+                                )
+
+                                mcp_tools_dict[f"{server_id}_{tool_spec['name']}"] = {
+                                    "spec": {
+                                        **tool_spec,
+                                        "name": f"{server_id}_{tool_spec['name']}",
+                                    },
+                                    "callable": tool_function,
+                                    "type": "mcp",
+                                    "client": mcp_clients[server_id],
+                                    "direct": False,
+                                }
+                        except Exception as e:
+                            log.debug(e)
+                            continue
+
+                tools_dict = await get_tools(
+                    request,
+                    tool_ids,
+                    user,
+                    {
+                        **extra_params,
+                        "__model__": models[task_model_id],
+                        "__messages__": form_data["messages"],
+                        "__files__": metadata.get("files", []),
+                    },
+                )
+                if mcp_tools_dict:
+                    tools_dict = {**tools_dict, **mcp_tools_dict}
+
+            if direct_tool_servers:
+                for tool_server in direct_tool_servers:
+                    tool_specs = tool_server.pop("specs", [])
+
+                    for tool in tool_specs:
+                        tools_dict[tool["name"]] = {
+                            "spec": tool,
+                            "direct": True,
+                            "server": tool_server,
+                        }
+
+            if mcp_clients:
+                metadata["mcp_clients"] = mcp_clients
+
+            if tools_dict:
+                if metadata.get("params", {}).get("function_calling") == "native":
+                    # If the function calling is native, then call the tools function calling handler
+                    metadata["tools"] = tools_dict
+                    form_data["tools"] = [
+                        {"type": "function", "function": tool.get("spec", {})}
+                        for tool in tools_dict.values()
+                    ]
+                else:
+                    # If the function calling is not native, then call the tools function calling handler
+                    try:
+                        form_data, flags = await chat_completion_tools_handler(
+                            request, form_data, extra_params, user, models, tools_dict
+                        )
+                        sources.extend(flags.get("sources", []))
                     except Exception as e:
-                        log.debug(e)
-                        continue
+                        log.exception(e)
 
-            tools_dict = await get_tools(
-                request,
-                tool_ids,
-                user,
-                {
-                    **extra_params,
-                    "__model__": models[task_model_id],
-                    "__messages__": form_data["messages"],
-                    "__files__": metadata.get("files", []),
-                },
-            )
-            if mcp_tools_dict:
-                tools_dict = {**tools_dict, **mcp_tools_dict}
+            return form_data, metadata, request, sources
 
-        if direct_tool_servers:
-            for tool_server in direct_tool_servers:
-                tool_specs = tool_server.pop("specs", [])
-
-                for tool in tool_specs:
-                    tools_dict[tool["name"]] = {
-                        "spec": tool,
-                        "direct": True,
-                        "server": tool_server,
-                    }
-
-        if mcp_clients:
-            metadata["mcp_clients"] = mcp_clients
-
-        if tools_dict:
-            if metadata.get("params", {}).get("function_calling") == "native":
-                # If the function calling is native, then call the tools function calling handler
-                metadata["tools"] = tools_dict
-                form_data["tools"] = [
-                    {"type": "function", "function": tool.get("spec", {})}
-                    for tool in tools_dict.values()
-                ]
-            else:
-                # If the function calling is not native, then call the tools function calling handler
-                try:
-                    form_data, flags = await chat_completion_tools_handler(
-                        request, form_data, extra_params, user, models, tools_dict
-                    )
-                    sources.extend(flags.get("sources", []))
-                except Exception as e:
-                    log.exception(e)
+            
+        if experimental_mode_enabled:
+            form_data, metadata, request, sources = await process_tools_and_functions(form_data, metadata, request, user, sources)
+            form_data = await process_features(form_data, sources)
+        else:
+            form_data = await process_features(form_data, sources)
+            form_data, metadata, request, sources = await process_tools_and_functions(form_data, metadata, request, user, sources)
 
         try:
             form_data, flags = await chat_completion_files_handler(
@@ -1409,6 +1549,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
         # If context is not empty, insert it into the messages
         if len(sources) > 0:
+            prompt = get_last_user_message(form_data["messages"])
+
             context_string = ""
             citation_idx_map = {}
 

@@ -51,3 +51,8 @@ def get_trace_url_from_span(span) -> str:
     except Exception as e:
         log.warning(f"Failed to get trace URL from span: {e}")
         return None
+
+def get_prompt(prompt_name: str) -> str:
+    """Get a prompt from Langfuse."""
+    langfuse_client = get_langfuse_client()
+    return langfuse_client.get_prompt(prompt_name).compile()
